@@ -75,6 +75,7 @@ def test_missing_cookie_keys_flags_stale_two_cookie_format():
         (1, "Not enough points. Need 500, have 320.0000000000000000", False),
         (-2, "其他错误", False),  # -2 但不是权限问题, 不做 Cookie 归因
         (0, "Checkin! Got 1 Points", False),
+        (4, "Automated check-in detected. Please sign in again to continue.", False),
     ],
 )
 def test_is_permission_error_matches_real_api_responses(code, message, expected):
@@ -82,14 +83,67 @@ def test_is_permission_error_matches_real_api_responses(code, message, expected)
     assert checkin.is_permission_error(code, message) is expected
 
 
+@pytest.mark.parametrize(
+    "code,message,expected",
+    [
+        (4, "Automated check-in detected. Please sign in again to continue.", True),
+        (4, "automated check-in detected", True),  # 大小写不敏感
+        (0, "Checkin! Got 7 Points", False),
+        (1, "Today's observation logged. Return tomorrow for more points.", False),
+        (-2, "没有权限", False),  # 认证失败不是自动化拦截, 不能混为一谈
+    ],
+)
+def test_is_automation_blocked_distinguishes_code_4_from_auth_failure(code, message, expected):
+    """code 4 与 code -2 是两种完全不同的故障, 诊断必须区分开。"""
+    assert checkin.is_automation_blocked(code, message) is expected
+
+
+# --------------------------------------------------------------------------
+# User-Agent 配置 (2026-09 起 GLaDOS 用它做反自动化校验)
+# --------------------------------------------------------------------------
+
+
+def test_config_uses_default_user_agent_when_env_absent(monkeypatch):
+    """需求: 未配置 GLADOS_USER_AGENT 时使用能通过校验的默认 UA。"""
+    monkeypatch.delenv(checkin.Config.ENV_USER_AGENT, raising=False)
+    config = _config_with_cookie(monkeypatch, FULL_FOUR_COOKIE)
+
+    assert config.user_agent == checkin.Config.DEFAULT_USER_AGENT
+    assert "Windows" not in config.user_agent  # 实测 Windows UA 会被判定为自动签到
+
+
+def test_config_user_agent_can_be_overridden_by_env(monkeypatch):
+    """需求: 登录平台不是 macOS 的用户必须能用 GLADOS_USER_AGENT 覆盖。"""
+    config = _config_with_cookie(
+        monkeypatch, FULL_FOUR_COOKIE, user_agent="UA_FROM_USER_BROWSER"
+    )
+
+    assert config.user_agent == "UA_FROM_USER_BROWSER"
+
+
+def test_api_sends_the_configured_user_agent(monkeypatch):
+    """失败模式: 配置了 UA 但请求仍带旧硬编码 UA, 会继续被 code 4 拦下。"""
+    config = _config_with_cookie(monkeypatch, FULL_FOUR_COOKIE)
+    config.user_agent = "UA_MUST_REACH_THE_WIRE"
+
+    assert checkin.API("glados.cloud", 1, user_agent=config.user_agent).headers["user-agent"] == (
+        "UA_MUST_REACH_THE_WIRE"
+    )
+
+
+
 # --------------------------------------------------------------------------
 # 配置期 Cookie 校验 (只警告, 不泄露凭据)
 # --------------------------------------------------------------------------
 
 
-def _config_with_cookie(monkeypatch, cookie: str) -> checkin.Config:
+def _config_with_cookie(monkeypatch, cookie: str, user_agent=None) -> checkin.Config:
     monkeypatch.setenv(checkin.Config.ENV_COOKIES, cookie)
     monkeypatch.delenv(checkin.Config.ENV_PUSH_KEY, raising=False)
+    if user_agent is None:
+        monkeypatch.delenv(checkin.Config.ENV_USER_AGENT, raising=False)
+    else:
+        monkeypatch.setenv(checkin.Config.ENV_USER_AGENT, user_agent)
     return checkin.Config()
 
 
@@ -240,6 +294,46 @@ def test_api_checkin_reports_failure_when_request_raises(monkeypatch):
     assert result["points"] == "0"
 
 
+class _FakeResponse:
+    """只实现 API 层用到的 json()。"""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def test_api_checkin_hints_user_agent_when_automation_detected(monkeypatch, caplog):
+    """失败模式: 线上 2026-09-25 实测的 code 4 必须提示 GLADOS_USER_AGENT,
+    而不是被误判成 Cookie 失效。"""
+    api = checkin.API(
+        "glados.cloud",
+        1,
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
+    )
+    monkeypatch.setattr(
+        api,
+        "_make_request",
+        lambda *a, **k: _FakeResponse(
+            {
+                "code": 4,
+                "message": "Automated check-in detected. Please sign in again to continue.",
+            }
+        ),
+    )
+
+    with caplog.at_level("ERROR"):
+        result = api.checkin(FULL_FOUR_COOKIE)
+
+    assert result["status"] == "签到失败"
+    assert "GLADOS_USER_AGENT" in caplog.text
+    assert "navigator.userAgent" in caplog.text
+    assert "认证失败" not in caplog.text
+    assert COOKIE_SENTINEL not in caplog.text
+
+
 # --------------------------------------------------------------------------
 # 端到端: 真实服务端 + 真实脚本进程
 # --------------------------------------------------------------------------
@@ -249,6 +343,7 @@ def _run_checkin(env_overrides: dict) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env.pop(checkin.Config.ENV_COOKIES, None)
     env.pop(checkin.Config.ENV_PUSH_KEY, None)
+    env.pop(checkin.Config.ENV_USER_AGENT, None)
     env.update(env_overrides)
 
     return subprocess.run(

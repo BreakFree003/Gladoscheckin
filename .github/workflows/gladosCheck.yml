@@ -52,6 +52,8 @@ jobs:
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+        # GLaDOS 会校验签到请求的平台是否与登录浏览器一致, 平台不符会被判定为自动签到 (code 4)
+        GLADOS_USER_AGENT: ${{ secrets.GLADOS_USER_AGENT }}
 
     - name: Keep alive
       uses: liskin/gh-workflow-keepalive@v1 

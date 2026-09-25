@@ -65,6 +65,14 @@ COOKIE_EXTRA_KEYS: Tuple[str, ...] = ("gld:sess", "gld:sess.sig")
 """认证失败时服务端返回的关键字 (中英文站点各一份)"""
 PERMISSION_ERROR_HINTS: Tuple[str, ...] = ("没有权限", "no permission")
 
+"""GLaDOS 判定「自动签到」时返回的 code 与关键字。
+
+2026-09 实测: 同一份 Cookie, User-Agent 平台对不上登录浏览器时,
+/api/user/checkin 返回 code 4「Automated check-in detected」, 而
+status/points 等接口照常工作, 很容易被误判成 Cookie 失效。"""
+AUTOMATION_ERROR_CODE = 4
+AUTOMATION_ERROR_HINTS: Tuple[str, ...] = ("automated check-in detected",)
+
 """进程退出码: 0 全部账号成功; 1 有账号在所有域名上都失败; 2 配置错误 (无 Cookie)"""
 EXIT_OK = 0
 EXIT_CHECKIN_FAILED = 1
@@ -94,6 +102,14 @@ def is_permission_error(code: int, message: str) -> bool:
         return False
     lowered = (message or "").lower()
     return any(hint in lowered for hint in PERMISSION_ERROR_HINTS)
+
+
+def is_automation_blocked(code: int, message: str) -> bool:
+    """判断签到是否被 GLaDOS 的反自动化校验拦下 (code 4)。"""
+    lowered = (message or "").lower()
+    return code == AUTOMATION_ERROR_CODE or any(
+        hint in lowered for hint in AUTOMATION_ERROR_HINTS
+    )
 
 
 def log_method(func):
@@ -140,6 +156,16 @@ class Config:
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
+    ENV_USER_AGENT = "GLADOS_USER_AGENT"
+
+    """默认 User-Agent。
+
+GLaDOS 的反自动化校验会比对「签到请求的平台」与「登录时浏览器的平台」:
+2026-09 实测同一份 Cookie 下, macOS UA 可以签到, Windows / Linux / iPhone UA
+一律返回 code 4「Automated check-in detected」(改动 Chrome 版本号无影响)。
+因此这里默认给一个 macOS 桌面 Chrome UA, 并用 GLADOS_USER_AGENT 覆盖成
+你自己浏览器的 navigator.userAgent 才是最稳的做法。"""
+    DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
 
     """默认兑换计划"""
     DEFAULT_EXCHANGE_PLAN = "plan500"
@@ -162,6 +188,7 @@ class Config:
         self.cookies_list: List[str] = []
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
+        self.user_agent: str = self.DEFAULT_USER_AGENT
         self._load_config()
 
     def _load_config(self) -> None:
@@ -170,6 +197,7 @@ class Config:
         raw_cookies_env: Optional[str] = os.environ.get(self.ENV_COOKIES)
         exchange_plan_env: Optional[str] = os.environ.get(self.ENV_EXCHANGE_PLAN)
         verbose_env: Optional[str] = os.environ.get(self.ENV_VERBOSE)
+        user_agent_env: Optional[str] = os.environ.get(self.ENV_USER_AGENT)
 
         if not push_key_env:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_PUSH_KEY}' 未设置。")
@@ -212,6 +240,15 @@ class Config:
 
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_VERBOSE}: {self.verbose}。")
 
+        if user_agent_env and user_agent_env.strip():
+            self.user_agent = user_agent_env.strip()
+            logger.info(f"{LogEmoji.INFO} 使用 {self.ENV_USER_AGENT} 指定的 User-Agent。")
+        else:
+            logger.info(
+                f"{LogEmoji.INFO} 未设置 {self.ENV_USER_AGENT}, 使用默认 {self.user_agent}。"
+                "若签到被判定为自动签到 (code 4), 请把它设为你浏览器的 navigator.userAgent。"
+            )
+
     def _validate_cookies(self) -> None:
         """校验 Cookie 结构, 只输出字段名与数量, 不输出凭据本身。"""
         for idx, cookie in enumerate(self.cookies_list, 1):
@@ -243,12 +280,20 @@ class API:
     POINTS_URL = APIEndpoint.POINTS.value
     EXCHANGE_URL = APIEndpoint.EXCHANGE.value
 
-    def __init__(self, domain: str, cookie_index: int = 0, verbose: bool = False):
+    def __init__(
+        self,
+        domain: str,
+        cookie_index: int = 0,
+        verbose: bool = False,
+        user_agent: str = Config.DEFAULT_USER_AGENT,
+    ):
         self.domain: str = domain
         self.cookie_index: int = cookie_index
         self.verbose: bool = verbose
+        self.user_agent: str = user_agent
         self.headers: Dict[str, str] = self._get_headers()
         self._auth_error_reported: bool = False
+        self._automation_error_reported: bool = False
         self.session = requests.Session()
         self.session.headers.update(self.headers)
 
@@ -277,7 +322,7 @@ class API:
         """获取请求头"""
         return {
             "origin": f"https://{self.domain}",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
+            "user-agent": self.user_agent,
         }
 
     def _log(self, level: str, emoji: str, message: str, force: bool = False) -> None:
@@ -308,6 +353,23 @@ class API:
             f"{endpoint} 认证失败 (code -2, message: {message})：Cookie 无效、已过期或不完整。"
             "GLaDOS 现要求 Cookie 同时包含 koa:sess、koa:sess.sig、gld:sess、gld:sess.sig；"
             "请重新登录并复制完整 Cookie 更新 GLADOS_COOKIES。",
+            force=True,
+        )
+
+    def _report_automation_block(self, message: str) -> None:
+        """被判定为自动签到 (code 4) 时输出一次可操作的提示。"""
+        if self._automation_error_reported:
+            return
+        self._automation_error_reported = True
+        self._log(
+            "error",
+            LogEmoji.ERROR,
+            f"签到被判定为自动签到 (message: {message})："
+            "GLaDOS 会校验签到请求的平台是否与登录浏览器一致。"
+            f"当前 User-Agent 为 [{self.user_agent}]，"
+            "实测 Windows / Linux / iPhone UA 均会被拦下 (改 Chrome 版本号无效)。"
+            "请在浏览器控制台执行 navigator.userAgent 取得完整值，"
+            "再把它设为 GLADOS_USER_AGENT。",
             force=True,
         )
 
@@ -373,6 +435,8 @@ class API:
                 self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
                 if is_permission_error(code, message):
                     self._report_auth_error("checkin", message)
+                elif is_automation_blocked(code, message):
+                    self._report_automation_block(message)
                 result["code"] = CheckinStatus.FAILURE
                 result["status"] = "签到失败"
                 result["points"] = "0"
@@ -550,7 +614,7 @@ class Checker:
     def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
         result = CheckinResult(cookie_idx, domain)
 
-        with API(domain, cookie_idx, verbose=self.config.verbose) as api:
+        with API(domain, cookie_idx, verbose=self.config.verbose, user_agent=self.config.user_agent) as api:
             # 1. 获取状态
             self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
             days_str, status_code = api.get_status(cookie)
@@ -664,7 +728,9 @@ def main() -> int:
                     f"{LogEmoji.ERROR} Cookie "
                     f"{', '.join(f'[{idx}]' for idx in failed_indexes)} "
                     "在所有域名上都未签到成功, 请检查 Cookie 是否完整/过期 "
-                    "(GLaDOS 现要求 koa:sess、koa:sess.sig、gld:sess、gld:sess.sig)。"
+                    "(GLaDOS 现要求 koa:sess、koa:sess.sig、gld:sess、gld:sess.sig)，"
+                    "或签到被判定为自动签到 (code 4, 需把 GLADOS_USER_AGENT 设为浏览器 "
+                    "navigator.userAgent)。"
                 )
 
     except Exception as e:
