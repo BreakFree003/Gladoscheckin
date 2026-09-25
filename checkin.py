@@ -1,6 +1,7 @@
 import requests
 import json
 import os
+import sys
 import logging
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
@@ -52,6 +53,47 @@ class LogEmoji:
     WARNING = "⚠️ "
     ERROR = "🔴"
     INFO = "ℹ️ "
+
+
+"""GLaDOS 自 2026-09 起同时下发两套会话 Cookie。
+
+只带 koa:sess / koa:sess.sig 的旧 Cookie 会被服务端拒绝, 所有接口统一返回
+code -2「没有权限」, 表现为 Actions 里签到全部失败。"""
+COOKIE_BASE_KEYS: Tuple[str, ...] = ("koa:sess", "koa:sess.sig")
+COOKIE_EXTRA_KEYS: Tuple[str, ...] = ("gld:sess", "gld:sess.sig")
+
+"""认证失败时服务端返回的关键字 (中英文站点各一份)"""
+PERMISSION_ERROR_HINTS: Tuple[str, ...] = ("没有权限", "no permission")
+
+"""进程退出码: 0 全部账号成功; 1 有账号在所有域名上都失败; 2 配置错误 (无 Cookie)"""
+EXIT_OK = 0
+EXIT_CHECKIN_FAILED = 1
+EXIT_CONFIG_ERROR = 2
+
+
+def parse_cookie_keys(cookie: str) -> List[str]:
+    """解析 Cookie 字符串里出现的字段名。只返回字段名, 不返回字段值, 避免泄露凭据。"""
+    keys: List[str] = []
+    for part in cookie.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        keys.append(part.split("=", 1)[0].strip())
+    return keys
+
+
+def missing_cookie_keys(cookie: str, keys: Tuple[str, ...]) -> List[str]:
+    """返回 keys 中在 Cookie 里缺失的字段名。"""
+    present = set(parse_cookie_keys(cookie))
+    return [key for key in keys if key not in present]
+
+
+def is_permission_error(code: int, message: str) -> bool:
+    """判断接口响应是否为认证/权限失败 (Cookie 缺失、不完整或已失效)。"""
+    if code != CheckinStatus.FAILURE.value:
+        return False
+    lowered = (message or "").lower()
+    return any(hint in lowered for hint in PERMISSION_ERROR_HINTS)
 
 
 def log_method(func):
@@ -155,6 +197,7 @@ class Config:
                 self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
 
         logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.cookies_list)} 个 Cookie 用于签到。")
+        self._validate_cookies()
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
 
@@ -168,6 +211,28 @@ class Config:
                 logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_VERBOSE}' 的值 '{verbose_env}' 无效，将使用默认值 {self.DEFAULT_VERBOSE}。")
 
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_VERBOSE}: {self.verbose}。")
+
+    def _validate_cookies(self) -> None:
+        """校验 Cookie 结构, 只输出字段名与数量, 不输出凭据本身。"""
+        for idx, cookie in enumerate(self.cookies_list, 1):
+            missing_base = missing_cookie_keys(cookie, COOKIE_BASE_KEYS)
+            if missing_base:
+                logger.warning(
+                    f"{LogEmoji.WARNING} Cookie[{idx}] 缺少 {', '.join(missing_base)}，"
+                    f"请重新从浏览器复制完整 Cookie 更新 {self.ENV_COOKIES}。"
+                )
+                continue
+
+            missing_extra = missing_cookie_keys(cookie, COOKIE_EXTRA_KEYS)
+            if missing_extra:
+                logger.warning(
+                    f"{LogEmoji.WARNING} Cookie[{idx}] 缺少 {', '.join(missing_extra)}："
+                    "GLaDOS 已改为同时校验 koa:sess/koa:sess.sig 与 gld:sess/gld:sess.sig，"
+                    "只剩前两项时所有接口都会返回 code -2「没有权限」，签到必然失败。"
+                    f"请重新登录后复制完整 Cookie 更新 {self.ENV_COOKIES}。"
+                )
+            else:
+                logger.info(f"{LogEmoji.INFO} Cookie[{idx}] 关键字段完整 ({len(parse_cookie_keys(cookie))} 项)。")
 
 
 class API:
@@ -183,6 +248,7 @@ class API:
         self.cookie_index: int = cookie_index
         self.verbose: bool = verbose
         self.headers: Dict[str, str] = self._get_headers()
+        self._auth_error_reported: bool = False
         self.session = requests.Session()
         self.session.headers.update(self.headers)
 
@@ -230,6 +296,20 @@ class API:
     def _get_full_url(self, path: str) -> str:
         """获取完整 URL"""
         return f"https://{self.domain}{path}"
+
+    def _report_auth_error(self, endpoint: str, message: str) -> None:
+        """认证失败时输出一次可操作的提示, 避免每个接口重复刷屏。"""
+        if self._auth_error_reported:
+            return
+        self._auth_error_reported = True
+        self._log(
+            "error",
+            LogEmoji.ERROR,
+            f"{endpoint} 认证失败 (code -2, message: {message})：Cookie 无效、已过期或不完整。"
+            "GLaDOS 现要求 Cookie 同时包含 koa:sess、koa:sess.sig、gld:sess、gld:sess.sig；"
+            "请重新登录并复制完整 Cookie 更新 GLADOS_COOKIES。",
+            force=True,
+        )
 
     def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "") -> Optional[requests.Response]:
         """发送 HTTP 请求"""
@@ -291,6 +371,8 @@ class API:
                 result["message"] = message
             else:
                 self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
+                if is_permission_error(code, message):
+                    self._report_auth_error("checkin", message)
                 result["code"] = CheckinStatus.FAILURE
                 result["status"] = "签到失败"
                 result["points"] = "0"
@@ -313,6 +395,7 @@ class API:
         if response:
             data = response.json()
             code = data.get("code", -2)
+            message = data.get("message", "")
             left_days = data.get("data", {}).get("leftDays", None)
 
             if left_days is not None:
@@ -321,6 +404,8 @@ class API:
                 return f"{left_days_int} 天", code
             else:
                 self._log("info", LogEmoji.FAIL, f"{{ code : {code}, leftDays : {left_days} 天}}", force=True)
+                if is_permission_error(code, message):
+                    self._report_auth_error("status", message)
                 return "None 天", code
         else:
             self._log("warning", LogEmoji.WARNING, "获取状态失败", force=True)
@@ -335,6 +420,7 @@ class API:
         if response:
             data = response.json()
             code = data.get("code", -2)
+            message = data.get("message", "")
             points = data.get("points", None)
 
             if points is not None:
@@ -345,6 +431,8 @@ class API:
                 return points_str, points_num
             else:
                 self._log("info", LogEmoji.FAIL, f"{{ code : {code}, points : {points} 积分}}", force=True)
+                if is_permission_error(code, message):
+                    self._report_auth_error("points", message)
                 return "None 积分", 0
         else:
             self._log("warning", LogEmoji.WARNING, "获取积分失败", force=True)
@@ -366,6 +454,8 @@ class API:
                 return f"兑换成功: {plan}"
             else:
                 self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
+                if is_permission_error(code, message):
+                    self._report_auth_error("exchange", message)
                 return f"兑换失败: {message}"
         else:
             self._log("warning", LogEmoji.WARNING, "兑换失败", force=True)
@@ -393,17 +483,22 @@ class CheckinResult:
 class PushService:
     """推送服务"""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Optional[Config] = None):
         self.config = config
+
+    @property
+    def push_key(self) -> str:
+        """推送密钥, 配置缺失时视为未设置。"""
+        return getattr(self.config, "push_key", "") or ""
 
     def send(self, title: str, content: str) -> bool:
         """发送推送"""
-        if not self.config.push_key:
+        if not self.push_key:
             logger.info(f"{LogEmoji.WARNING} 未设置推送密钥，跳过推送通知。")
             return False
 
         try:
-            pushdeer = PushDeer(pushkey=self.config.push_key)
+            pushdeer = PushDeer(pushkey=self.push_key)
             pushdeer.send_text(title, desp=content)
             logger.info(f"{LogEmoji.SUCCESS} 推送通知发送成功。")
             return True
@@ -488,6 +583,24 @@ class Checker:
         """获取所有结果"""
         return [result.to_dict() for result in self.results]
 
+    def failed_cookie_indexes(self) -> List[int]:
+        """返回在所有域名上都未签到成功/重复的 Cookie 序号。
+
+        同一个 Cookie 会被依次发往 glados.cloud 与 railgun.info, 通常只有其中一个
+        站点持有该账号, 另一个必然返回 code -2。因此以「该 Cookie 是否至少在一个
+        域名上成功」作为账号维度的成功判据, 避免把正常现象当成失败。
+        """
+        succeeded = {
+            result["cookie_index"]
+            for result in self.get_results()
+            if result["code"] in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
+        }
+        return [
+            idx
+            for idx in range(1, len(self.config.cookies_list) + 1)
+            if idx not in succeeded
+        ]
+
     def format_results(self) -> Tuple[str, str, str]:
         """格式化结果"""
         results = self.get_results()
@@ -519,8 +632,11 @@ class Checker:
 logger = init_logger()
 
 
-def main():
-    """主函数"""
+def main() -> int:
+    """主函数, 返回进程退出码 (0 成功 / 1 签到失败 / 2 配置错误)。"""
+    exit_code = EXIT_OK
+    config: Optional[Config] = None
+
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
@@ -529,6 +645,7 @@ def main():
         if not config.cookies_list:
             logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie, 退出程序。")
             title, content = "# 未找到 cookies!", ""
+            exit_code = EXIT_CONFIG_ERROR
         else:
             # 2. 执行签到
             logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
@@ -540,16 +657,28 @@ def main():
             title, content, log_content = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
+            failed_indexes = checker.failed_cookie_indexes()
+            if failed_indexes:
+                exit_code = EXIT_CHECKIN_FAILED
+                logger.error(
+                    f"{LogEmoji.ERROR} Cookie "
+                    f"{', '.join(f'[{idx}]' for idx in failed_indexes)} "
+                    "在所有域名上都未签到成功, 请检查 Cookie 是否完整/过期 "
+                    "(GLaDOS 现要求 koa:sess、koa:sess.sig、gld:sess、gld:sess.sig)。"
+                )
+
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
         title, content, log_content = "# 脚本执行出错", str(e), str(e)
+        exit_code = EXIT_CHECKIN_FAILED
 
     # 4. 发送推送
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config if "config" in locals() else "")
+    push_service = PushService(config)
     push_service.send(title, content)
-    logger.info(f"{LogEmoji.END} 签到完成")
+    logger.info(f"{LogEmoji.END} 签到完成 (退出码 {exit_code})")
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
