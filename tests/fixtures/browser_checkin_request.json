@@ -1,0 +1,77 @@
+{
+  "_comment": [
+    "真机抓包: 2026-09-26 本机 Chrome 154 (macOS) 在 https://glados.cloud/console/checkin 点击「签到」按钮时, 浏览器实际发出的那一次请求。",
+    "抓取方式: CDP (127.0.0.1:9222) 打开 Network 域, 监听 Network.requestWillBeSent / requestWillBeSentExtraInfo / Network.getResponseBody。",
+    "requestWillBeSentExtraInfo.headers 是真正上线缆的头 (含浏览器自动加的 sec-ch-ua* / sec-fetch-* / accept-language / dnt 等)。",
+    "cookie 值已脱敏, 只留字段名; 原始值为 354 字节, 含 __stripe_mid / eu_cookie / koa:sess / koa:sess.sig / gld:sess / gld:sess.sig。",
+    "注意: 页面 /console 带 <meta name=\"referrer\" content=\"no-referrer\">, 因此这次请求没有任何 Referer 头。"
+  ],
+  "captured_at": "2026-09-26T10:44:33Z",
+  "capture_method": "chrome-devtools-protocol",
+  "browser": {
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+    "navigator_languages": ["zh-CN"],
+    "page": "https://glados.cloud/console/checkin",
+    "meta_referrer": "no-referrer"
+  },
+  "request": {
+    "method": "POST",
+    "url": "https://glados.cloud/api/user/checkin",
+    "protocol": "h2",
+    "postData": "{\"token\":\"glados.cloud\"}",
+    "contentLength": 24,
+    "headers": {
+      "accept": "application/json, text/plain, */*",
+      "accept-encoding": "gzip, deflate, br, zstd",
+      "accept-language": "zh-CN,zh;q=0.9",
+      "content-length": "24",
+      "content-type": "application/json;charset=UTF-8",
+      "cookie": "<redacted; fields: __stripe_mid, eu_cookie, koa:sess, koa:sess.sig, gld:sess, gld:sess.sig>",
+      "dnt": "1",
+      "origin": "https://glados.cloud",
+      "priority": "u=1, i",
+      "sec-ch-ua": "\"Chromium\";v=\"154\", \"Google Chrome\";v=\"154\", \"Not A(Brand\";v=\"99\"",
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": "\"macOS\"",
+      "sec-fetch-dest": "empty",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-site": "same-origin",
+      "sec-gpc": "1",
+      "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "code": 1,
+      "message": "Today's observation logged. Return tomorrow for more points.",
+      "points": 0
+    }
+  },
+  "script_control": {
+    "_comment": "checkin.py 自己能决定、且必须与浏览器逐字一致的头部/请求体。",
+    "headers": {
+      "accept": "application/json, text/plain, */*",
+      "content-type": "application/json;charset=UTF-8",
+      "origin": "https://glados.cloud",
+      "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+    },
+    "must_be_absent": ["referer", "authorization"]
+  },
+  "browser_only_headers": {
+    "_comment": "由浏览器进程生成、脚本刻意不伪造的头。它们缺失时服务端仍然返回 code 1 (2026-09-26 实测), 见 tests 与 README。",
+    "headers": [
+      "accept-encoding",
+      "accept-language",
+      "dnt",
+      "priority",
+      "sec-ch-ua",
+      "sec-ch-ua-mobile",
+      "sec-ch-ua-platform",
+      "sec-fetch-dest",
+      "sec-fetch-mode",
+      "sec-fetch-site",
+      "sec-gpc"
+    ]
+  }
+}

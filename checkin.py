@@ -55,12 +55,24 @@ class LogEmoji:
     INFO = "ℹ️ "
 
 
-"""GLaDOS 自 2026-09 起同时下发两套会话 Cookie。
+"""每个站点各自下发一套会话 Cookie (2026-09-26 起, 见上游 issue #37 的实测反馈):
+glados.cloud 用 gld:sess / gld:sess.sig, railgun.info 用 koa:sess / koa:sess.sig。
 
-只带 koa:sess / koa:sess.sig 的旧 Cookie 会被服务端拒绝, 所有接口统一返回
-code -2「没有权限」, 表现为 Actions 里签到全部失败。"""
-COOKIE_BASE_KEYS: Tuple[str, ...] = ("koa:sess", "koa:sess.sig")
-COOKIE_EXTRA_KEYS: Tuple[str, ...] = ("gld:sess", "gld:sess.sig")
+只在其中一个站点注册时, 只复制那个站点的 Cookie 就够; 两个站点都有账号时,
+把两对 Cookie 用 "; " 拼成一份即可 —— 同一份 Cookie 会依次发给两个域名,
+不持有账号的那个域名必然返回 code -2, 属于正常现象。"""
+SITE_COOKIE_KEYS: Dict[str, Tuple[str, ...]] = {
+    "glados.cloud": ("gld:sess", "gld:sess.sig"),
+    "railgun.info": ("koa:sess", "koa:sess.sig"),
+}
+
+"""所有已知的会话字段, 仅用于在日志里给出完整的可选项。"""
+ALL_COOKIE_KEYS: Tuple[str, ...] = (
+    "gld:sess",
+    "gld:sess.sig",
+    "koa:sess",
+    "koa:sess.sig",
+)
 
 """认证失败时服务端返回的关键字 (中英文站点各一份)"""
 PERMISSION_ERROR_HINTS: Tuple[str, ...] = ("没有权限", "no permission")
@@ -94,6 +106,18 @@ def missing_cookie_keys(cookie: str, keys: Tuple[str, ...]) -> List[str]:
     """返回 keys 中在 Cookie 里缺失的字段名。"""
     present = set(parse_cookie_keys(cookie))
     return [key for key in keys if key not in present]
+
+
+def complete_cookie_sites(cookie: str) -> List[str]:
+    """返回这份 Cookie 中「会话字段齐全」的站点域名。
+
+    gld:sess 与 koa:sess 分属 glados.cloud 与 railgun.info, 只要有一对完整就能
+    在对应站点签到; 两对都不完整才说明 Cookie 复制错了。"""
+    return [
+        domain
+        for domain, keys in SITE_COOKIE_KEYS.items()
+        if not missing_cookie_keys(cookie, keys)
+    ]
 
 
 def is_permission_error(code: int, message: str) -> bool:
@@ -250,26 +274,35 @@ GLaDOS 的反自动化校验会比对「签到请求的平台」与「登录时�
             )
 
     def _validate_cookies(self) -> None:
-        """校验 Cookie 结构, 只输出字段名与数量, 不输出凭据本身。"""
+        """校验 Cookie 结构, 只输出字段名与数量, 不输出凭据本身。
+
+        每个站点各有一套会话字段, 因此判据是「至少有一对完整」, 而不是
+        「两对都必须有」: 只在 glados.cloud 或只在 railgun.info 注册的用户,
+        本来就只能拿到其中一对。
+        """
         for idx, cookie in enumerate(self.cookies_list, 1):
-            missing_base = missing_cookie_keys(cookie, COOKIE_BASE_KEYS)
-            if missing_base:
-                logger.warning(
-                    f"{LogEmoji.WARNING} Cookie[{idx}] 缺少 {', '.join(missing_base)}，"
-                    f"请重新从浏览器复制完整 Cookie 更新 {self.ENV_COOKIES}。"
+            sites = complete_cookie_sites(cookie)
+            if sites:
+                site_desc = "、".join(
+                    f"{domain} ({'/'.join(SITE_COOKIE_KEYS[domain])})" for domain in sites
+                )
+                logger.info(
+                    f"{LogEmoji.INFO} Cookie[{idx}] 会话字段完整 "
+                    f"({len(parse_cookie_keys(cookie))} 项), 可用于: {site_desc}。"
                 )
                 continue
 
-            missing_extra = missing_cookie_keys(cookie, COOKIE_EXTRA_KEYS)
-            if missing_extra:
-                logger.warning(
-                    f"{LogEmoji.WARNING} Cookie[{idx}] 缺少 {', '.join(missing_extra)}："
-                    "GLaDOS 已改为同时校验 koa:sess/koa:sess.sig 与 gld:sess/gld:sess.sig，"
-                    "只剩前两项时所有接口都会返回 code -2「没有权限」，签到必然失败。"
-                    f"请重新登录后复制完整 Cookie 更新 {self.ENV_COOKIES}。"
-                )
-            else:
-                logger.info(f"{LogEmoji.INFO} Cookie[{idx}] 关键字段完整 ({len(parse_cookie_keys(cookie))} 项)。")
+            present = parse_cookie_keys(cookie)
+            missing_desc = "；".join(
+                f"{domain} 需要 {'/'.join(keys)}" for domain, keys in SITE_COOKIE_KEYS.items()
+            )
+            logger.warning(
+                f"{LogEmoji.WARNING} Cookie[{idx}] 没有一对完整的会话字段 "
+                f"(当前字段: {', '.join(present) if present else '无'})。"
+                f"{missing_desc}。只在一个站点注册时复制该站点的 Cookie 即可, "
+                f"两个站点都有账号时把两对 Cookie 用 \"; \" 拼在一起。"
+                f"请重新复制完整 Cookie 更新 {self.ENV_COOKIES}。"
+            )
 
 
 class API:
@@ -279,6 +312,9 @@ class API:
     STATUS_URL = APIEndpoint.STATUS.value
     POINTS_URL = APIEndpoint.POINTS.value
     EXCHANGE_URL = APIEndpoint.EXCHANGE.value
+
+    """POST 的 content-type, 与站点前端 axios 发出的一致 (带 charset, 无空格)。"""
+    CONTENT_TYPE_JSON = "application/json;charset=UTF-8"
 
     def __init__(
         self,
@@ -319,9 +355,23 @@ class API:
         return False
 
     def _get_headers(self) -> Dict[str, str]:
-        """获取请求头"""
+        """获取请求头, 逐字对齐「网页上点签到」时浏览器发出的头。
+
+        站点 console 包里 `axios.defaults.baseURL="/api"` 且
+        `axios.post("/user/checkin", {token: location.hostname})`, axios 自己只设置
+        accept(默认值)与 content-type(POST)。其余由浏览器生成。
+
+        2026-09-26 用 CDP 抓了本机 Chrome 154 (macOS) 在 /console/checkin 点「签到」
+        的真实请求 (见 tests/fixtures/browser_checkin_request.json), 结论:
+        - accept 就是 `application/json, text/plain, */*`;
+        - 页面 /console 带 `<meta name="referrer" content="no-referrer">`,
+          所以浏览器**没有**发 Referer —— 这里也就不能自己造一个;
+        - sec-ch-ua* / sec-fetch-* / accept-language / dnt 是浏览器进程生成的头,
+          脚本不伪造 (实测缺了它们服务端照样返回 code 1, 而伪造的
+          sec-ch-ua-platform 会和用户自定义的 GLADOS_USER_AGENT 自相矛盾)。"""
         return {
             "origin": f"https://{self.domain}",
+            "accept": "application/json, text/plain, */*",
             "user-agent": self.user_agent,
         }
 
@@ -347,40 +397,72 @@ class API:
         if self._auth_error_reported:
             return
         self._auth_error_reported = True
+        site_keys = SITE_COOKIE_KEYS.get(self.domain, ALL_COOKIE_KEYS)
         self._log(
             "error",
             LogEmoji.ERROR,
             f"{endpoint} 认证失败 (code -2, message: {message})：Cookie 无效、已过期或不完整。"
-            "GLaDOS 现要求 Cookie 同时包含 koa:sess、koa:sess.sig、gld:sess、gld:sess.sig；"
+            f"{self.domain} 需要 {'/'.join(site_keys)}；若你的账号在另一个站点, "
+            "请改用那个站点的 Cookie；两个站点都有账号时把两对 Cookie 用 \"; \" 拼成一份。"
             "请重新登录并复制完整 Cookie 更新 GLADOS_COOKIES。",
             force=True,
         )
 
-    def _report_automation_block(self, message: str) -> None:
-        """被判定为自动签到 (code 4) 时输出一次可操作的提示。"""
+    def _report_automation_block(self, payload: Dict) -> None:
+        """被判定为自动签到 (code 4) 时输出一次可操作的提示。
+
+        站点前端在 code 4 且 reason == "device-mismatch" 时会弹出「设备不一致,
+        请重新登录」的对话框, 并把服务端给的 loginDevice / currentDevice 显示出来;
+        脚本这边同样把这两个值打出来, 直接指出是哪台「设备」对不上。"""
         if self._automation_error_reported:
             return
         self._automation_error_reported = True
+
+        message = payload.get("message", "")
+        details = [
+            f"{key}: {payload[key]}"
+            for key in ("reason", "loginDevice", "currentDevice")
+            if payload.get(key)
+        ]
+        detail_text = f"(服务端返回 {'; '.join(details)}) " if details else ""
+
         self._log(
             "error",
             LogEmoji.ERROR,
-            f"签到被判定为自动签到 (message: {message})："
-            "GLaDOS 会校验签到请求的平台是否与登录浏览器一致。"
-            f"当前 User-Agent 为 [{self.user_agent}]，"
-            "实测 Windows / Linux / iPhone UA 均会被拦下 (改 Chrome 版本号无效)。"
-            "请在浏览器控制台执行 navigator.userAgent 取得完整值，"
-            "再把它设为 GLADOS_USER_AGENT。",
+            f"签到被判定为自动签到 (message: {message})。"
+            f"{detail_text}GLaDOS 会比对「登录时的设备平台」与「这次请求声明的平台」，"
+            f"脚本里能声明平台的只有 User-Agent，当前为 [{self.user_agent}]。"
+            "请在**当时登录的那个浏览器**的控制台执行 navigator.userAgent，"
+            "把完整值设为 GLADOS_USER_AGENT (Windows / Linux / iPhone 的 UA 实测都会被拦下)。",
             force=True,
         )
 
+    def _serialize_post_body(self, data: Optional[Dict]) -> bytes:
+        """按 axios 的方式序列化 JSON 请求体。
+
+        axios 用 `JSON.stringify` 的紧凑格式 (`{"token":"glados.cloud"}`), 而
+        requests 的 `json=` 走 `json.dumps` 默认分隔符, 会多出空格
+        (`{"token": "glados.cloud"}`)。这里对齐成浏览器那一份字节。"""
+        return json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
     def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "") -> Optional[requests.Response]:
-        """发送 HTTP 请求"""
+        """发送 HTTP 请求。
+
+        请求体与 POST 的 content-type 与网页端逐字一致: 站点前端走 axios,
+        请求体是紧凑 JSON, content-type 为 `application/json;charset=UTF-8`。
+        GET 请求则**不带** content-type —— 浏览器的 GET 也不带。"""
         session_headers = self.headers.copy()
         session_headers["cookie"] = cookies
 
         try:
             if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=data, timeout=(60, 120))
+                session_headers["content-type"] = self.CONTENT_TYPE_JSON
+                response = self.session.post(
+                    url,
+                    headers=session_headers,
+                    data=self._serialize_post_body(data),
+                    timeout=(60, 120),
+                )
             elif method.upper() == "GET":
                 response = self.session.get(url, headers=session_headers, timeout=(60, 120))
             else:
@@ -436,7 +518,7 @@ class API:
                 if is_permission_error(code, message):
                     self._report_auth_error("checkin", message)
                 elif is_automation_blocked(code, message):
-                    self._report_automation_block(message)
+                    self._report_automation_block(data)
                 result["code"] = CheckinStatus.FAILURE
                 result["status"] = "签到失败"
                 result["points"] = "0"
@@ -728,7 +810,8 @@ def main() -> int:
                     f"{LogEmoji.ERROR} Cookie "
                     f"{', '.join(f'[{idx}]' for idx in failed_indexes)} "
                     "在所有域名上都未签到成功, 请检查 Cookie 是否完整/过期 "
-                    "(GLaDOS 现要求 koa:sess、koa:sess.sig、gld:sess、gld:sess.sig)，"
+                    "(glados.cloud 需要 gld:sess/gld:sess.sig, railgun.info 需要 "
+                    "koa:sess/koa:sess.sig), "
                     "或签到被判定为自动签到 (code 4, 需把 GLADOS_USER_AGENT 设为浏览器 "
                     "navigator.userAgent)。"
                 )
