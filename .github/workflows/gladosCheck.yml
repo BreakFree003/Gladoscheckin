@@ -56,6 +56,7 @@ jobs:
         # 手动触发不跳过: 手动点意味着「现在就跑一次」, 否则排查问题时会被静默跳过。
         if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
           echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "reported=false" >> "$GITHUB_OUTPUT"
           echo "ℹ️ 手动触发, 不跳过, 照常签到。"
           exit 0
         fi
@@ -90,6 +91,24 @@ jobs:
           echo "ℹ️ 今天还没有成功记录, 执行签到。"
         fi
 
+        # 脚本只在失败时推送。失败的一天里每个槽位都会失败, 不去重就会一天刷 4 条,
+        # 所以这里再查一次「今天有没有失败过」, 交给脚本决定要不要推。
+        reported=false
+        failed=0
+        if raw_failed=$(gh api -X GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/gladosCheck.yml/runs" \
+              -f status=failure -f "created=>=${since}" --jq '.total_count' 2>/dev/null); then
+          failed=${raw_failed:-0}
+        else
+          echo "::warning::查询今天的失败运行记录失败, 保守起见允许本次推送。"
+        fi
+        case "${failed}" in ''|*[!0-9]*) failed=0 ;; esac
+        if [ "${failed}" -gt 0 ]; then
+          reported=true
+        fi
+        echo "本工作流今天的失败运行数: ${failed}"
+        echo "reported=${reported}" >> "$GITHUB_OUTPUT"
+
     - name: Set up Python ${{ matrix.python-version }}
       if: steps.today.outputs.skip != 'true'
       uses: actions/setup-python@v6
@@ -116,6 +135,8 @@ jobs:
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
         # GLaDOS 会校验签到请求的平台是否与登录浏览器一致, 平台不符会被判定为自动签到 (code 4)
         GLADOS_USER_AGENT: ${{ secrets.GLADOS_USER_AGENT }}
+        # 今天已经失败过一次时置 true, 脚本据此不再重复推送 (一天最多推一条)
+        GLADOS_FAILURE_ALREADY_REPORTED: ${{ steps.today.outputs.reported }}
 
     # 签到失败时, 这两个收尾步骤也要照跑:
     # 用 if: always() 保证 keepalive 不会因为签到红了就被跳过, 否则工作流可能被

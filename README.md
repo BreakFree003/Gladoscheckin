@@ -58,6 +58,9 @@
 
 - 添加1个`repository secret`，命名为`PUSHDEER_SENDKEY`，其值对应 PushDeer key: ([获取地址](https://www.pushdeer.com/product.html))。
 
+推送只在**签到失败**时发送，签到正常不会推送；同一天多次失败也只推第一条（依据 GitHub
+运行记录判断今天是否已经报过），所以一天最多一条，不会因为一天有多个定时槽位而刷屏。
+
 5. User-Agent（**强烈建议配置**）
 
 GLaDOS 从 2026-09 起会校验「签到请求的平台」和「登录时浏览器的平台」是否一致，**对不上就会返回

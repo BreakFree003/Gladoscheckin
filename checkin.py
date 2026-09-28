@@ -629,6 +629,11 @@ class CheckinResult:
 class PushService:
     """推送服务"""
 
+    # 由 workflow 注入: 今天已经报过一次失败, 本次不要重复推送。
+    # 判据是 GitHub 运行记录里「北京时间今天」是否已有失败的运行 ——
+    # 失败的一天里每个槽位都会失败, 不去重就会一天刷 4 条。
+    ENV_FAILURE_ALREADY_REPORTED = "GLADOS_FAILURE_ALREADY_REPORTED"
+
     def __init__(self, config: Optional[Config] = None):
         self.config = config
 
@@ -637,10 +642,20 @@ class PushService:
         """推送密钥, 配置缺失时视为未设置。"""
         return getattr(self.config, "push_key", "") or ""
 
+    @property
+    def failure_already_reported(self) -> bool:
+        """今天是否已经推送过失败通知。"""
+        raw = os.environ.get(self.ENV_FAILURE_ALREADY_REPORTED, "")
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+
     def send(self, title: str, content: str) -> bool:
-        """发送推送"""
+        """发送推送。今天已经推过一次失败通知时不再重复发送。"""
         if not self.push_key:
             logger.info(f"{LogEmoji.WARNING} 未设置推送密钥，跳过推送通知。")
+            return False
+
+        if self.failure_already_reported:
+            logger.info(f"{LogEmoji.INFO} 今天已经推送过失败通知，跳过本次推送。")
             return False
 
         try:
@@ -821,10 +836,13 @@ def main() -> int:
         title, content, log_content = "# 脚本执行出错", str(e), str(e)
         exit_code = EXIT_CHECKIN_FAILED
 
-    # 4. 发送推送
+    # 4. 发送推送 (只在失败时通知, 避免正常签到天天刷屏)
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
     push_service = PushService(config)
-    push_service.send(title, content)
+    if exit_code == EXIT_OK:
+        logger.info(f"{LogEmoji.INFO} 签到正常，不发送推送 (只在失败时通知)。")
+    else:
+        push_service.send(title, content)
     logger.info(f"{LogEmoji.END} 签到完成 (退出码 {exit_code})")
     return exit_code
 
