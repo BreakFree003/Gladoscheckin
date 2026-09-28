@@ -1,9 +1,6 @@
 # GLaDOS 自动签到
 
-> **注册邀请与优惠码**
->
-> - 还没有 GLaDOS 账号：从 <https://glados.space> 注册
-> - 购买套餐时在优惠码一栏填 **`PORTALGUN`**，可享 **20% OFF**（八折）
+> 优惠码 **`PORTALGUN`**，购买套餐可享 **20% OFF**（八折）
 
 个人自用：用 GitHub Actions 每天定时跑一次 `checkin.py`，给 GLaDOS（`glados.cloud`
 或 `railgun.info`）签到。**签到失败时让作业变红，靠 GitHub 的失败邮件收到通知。**
