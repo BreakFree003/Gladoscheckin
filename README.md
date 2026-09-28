@@ -10,7 +10,8 @@
 | `checkin.py` | 签到脚本（唯一入口） |
 | `logging_config.py` | 日志配置 |
 | `.github/workflows/gladosCheck.yml` | 定时任务 |
-| `tests/test_checkin.py` | 测试 |
+| `tests/test_checkin.py` | 签到脚本的测试 |
+| `tests/test_workflow_gate.py` | workflow 里「今天是否已签到」那一步的测试 |
 
 ## 它每天是怎么跑的
 

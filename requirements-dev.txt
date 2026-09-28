@@ -1,2 +1,4 @@
 requests
 pytest
+# tests/test_workflow_gate.py 要解析 workflow YAML
+PyYAML
