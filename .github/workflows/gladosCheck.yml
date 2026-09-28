@@ -14,7 +14,8 @@ on:
     # cron 用的是 UTC, 北京时间 = UTC + 8。故意错开整点: GitHub 文档明确说 schedule
     # 是 best-effort, 整点高峰会延迟甚至直接丢弃; 2026-08 底起还有大范围漂移事件。
     # 实测本仓库的 schedule 事件会迟到 3~10 小时 (workflow_dispatch 则秒级启动),
-    # 所以一天留 4 个槽位互为兜底。脚本能识别「重复签到」, 多跑几次不会重复扣分。
+    # 所以一天留 4 个槽位互为兜底。第一个成功的槽位签到, 后面的槽位会直接跳过
+    # (见下面的「今天是否已经签到成功」), 所以多留槽位既不会重复签到也不会重复扣分。
     - cron: '7 16 * * *'   # 16:07 UTC = 北京 00:07, 刚好越过账户签到日界点, 是当天第一次
     - cron: '23 22 * * *'  # 22:23 UTC = 北京 06:23, 凌晨兜底
     - cron: '41 4 * * *'   # 04:41 UTC = 北京 12:41, 第二锚点
@@ -41,13 +42,53 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v6
 
+    # 4 个槽位互为兜底, 但一天只需要签到成功一次。成功之后后面的槽位直接跳过,
+    # 不再打重复签到。
+    # 标记就是 GitHub 自己的运行记录: 北京时间「今天」本工作流有没有成功运行过。
+    # 脚本是 fail-closed 的 (只有签到成功 code 0 / 重复签到 code 1 才退出 0),
+    # 所以「今天有成功运行」等价于「今天已经签到成功」。
+    # 查询失败时回退为照常签到 —— 宁可多签一次, 也绝不静默漏签。
+    - name: 今天是否已经签到成功
+      id: today
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # 手动触发不跳过: 手动点意味着「现在就跑一次」, 否则排查问题时会被静默跳过。
+        if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "ℹ️ 手动触发, 不跳过, 照常签到。"
+          exit 0
+        fi
+        # 北京时间今天 00:00 对应的 UTC 时刻 (北京 = UTC+8)
+        since=$(TZ=Asia/Shanghai date -d 'today 00:00' -u +%Y-%m-%dT%H:%M:%SZ)
+        count=0
+        if raw=$(gh api -X GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/gladosCheck.yml/runs" \
+              -f status=success -f "created=>=${since}" --jq '.total_count' 2>/dev/null); then
+          count=${raw:-0}
+        else
+          echo "::warning::查询今天的成功运行记录失败, 无法判断是否已签到, 回退为照常签到。"
+        fi
+        case "${count}" in ''|*[!0-9]*) count=0 ;; esac
+        echo "北京时间今天 00:00 = ${since} (UTC)"
+        echo "本工作流今天的成功运行数: ${count}"
+        if [ "${count}" -gt 0 ]; then
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "✅ 今天已经签到成功过, 跳过本次签到。"
+        else
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "ℹ️ 今天还没有成功记录, 执行签到。"
+        fi
+
     - name: Set up Python ${{ matrix.python-version }}
+      if: steps.today.outputs.skip != 'true'
       uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
 
     # 安装 python 库
     - name: Install dependencies
+      if: steps.today.outputs.skip != 'true'
       run: |
         python -m pip install --upgrade pip
         pip install requests
@@ -55,6 +96,7 @@ jobs:
 
     # 执行 签到脚本
     - name: Running checkin
+      if: steps.today.outputs.skip != 'true'
       run: |
         python checkin.py
       env:
