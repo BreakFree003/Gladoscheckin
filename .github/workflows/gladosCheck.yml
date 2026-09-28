@@ -3,14 +3,20 @@ name: auto check
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    # 默认分支是 master, 不是 main。写成 main 会让 push 触发完全不生效。
+    branches: [ master ]
     paths-ignore:
       - 'README.md'
       - 'imgs/**'
   schedule:
-    # cron 用的是 UTC: 16:01 UTC = 北京时间 00:01, 04:01 UTC = 北京时间 12:01。
-    # 00:01 那一跑刚好越过账户的签到日界点 (北京时间 0 点), 是当天第一次签到。
-    - cron: '1 16,4 * * *'
+    # cron 用的是 UTC, 北京时间 = UTC + 8。故意错开整点: GitHub 文档明确说 schedule
+    # 是 best-effort, 整点高峰会延迟甚至直接丢弃; 2026-08 底起还有大范围漂移事件。
+    # 实测本仓库的 schedule 事件会迟到 3~10 小时 (workflow_dispatch 则秒级启动),
+    # 所以一天留 4 个槽位互为兜底。脚本能识别「重复签到」, 多跑几次不会重复扣分。
+    - cron: '7 16 * * *'   # 16:07 UTC = 北京 00:07, 刚好越过账户签到日界点, 是当天第一次
+    - cron: '23 22 * * *'  # 22:23 UTC = 北京 06:23, 凌晨兜底
+    - cron: '41 4 * * *'   # 04:41 UTC = 北京 12:41, 第二锚点
+    - cron: '13 10 * * *'  # 10:13 UTC = 北京 18:13, 白天兜底
 
 jobs:
   build:
@@ -65,6 +71,8 @@ jobs:
       with:
         token: ${{ github.token }}
         repository: ${{ github.repository }}
-        retain_days: 7
-        keep_minimum_runs: 7
+        # 保留更长的历史: schedule 漂移需要连续多天的触发时间才能看出来,
+        # 原来 7 天会把排查漂移最需要的记录删掉。
+        retain_days: 30
+        keep_minimum_runs: 30
         delete_run_by_conclusion_pattern: success
