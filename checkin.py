@@ -2,11 +2,9 @@ import requests
 import json
 import os
 import sys
-import logging
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
-from pypushdeer import PushDeer
 from logging_config import init_logger
 
 
@@ -41,7 +39,6 @@ class LogEmoji:
     SUCCESS = "✅"
     FAIL = "❌"
     REPEAT = "🔄"
-    PENDING = "⏳"
     CHECKIN = "🎫"
     STATUS = "📊"
     POINTS = "💰"
@@ -137,17 +134,13 @@ def is_automation_blocked(code: int, message: str) -> bool:
 
 
 def log_method(func):
-    """日志装饰器"""
+    """异常兜底装饰器: 把 API 方法的异常记进日志, 并返回该方法对应的失败默认值。
+
+    注意这里只兜底、不改判成败: 返回的默认值都会被上层判成失败, 不会制造假绿。
+    """
 
     def wrapper(self, *args, **kwargs):
         method_name = func.__name__
-        emoji_map = {
-            "checkin": LogEmoji.CHECKIN,
-            "get_status": LogEmoji.STATUS,
-            "get_points": LogEmoji.POINTS,
-            "exchange": LogEmoji.EXCHANGE,
-        }
-        emoji = emoji_map.get(method_name, LogEmoji.INFO)
         try:
             result = func(self, *args, **kwargs)
             return result
@@ -176,7 +169,6 @@ def log_method(func):
 class Config:
     """应用配置"""
 
-    ENV_PUSH_KEY = "PUSHDEER_SENDKEY"
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
@@ -208,7 +200,6 @@ GLaDOS 的反自动化校验会比对「签到请求的平台」与「登录时�
     }
 
     def __init__(self):
-        self.push_key: str = ""
         self.cookies_list: List[str] = []
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
@@ -217,17 +208,10 @@ GLaDOS 的反自动化校验会比对「签到请求的平台」与「登录时�
 
     def _load_config(self) -> None:
         """加载配置"""
-        push_key_env: Optional[str] = os.environ.get(self.ENV_PUSH_KEY)
         raw_cookies_env: Optional[str] = os.environ.get(self.ENV_COOKIES)
         exchange_plan_env: Optional[str] = os.environ.get(self.ENV_EXCHANGE_PLAN)
         verbose_env: Optional[str] = os.environ.get(self.ENV_VERBOSE)
         user_agent_env: Optional[str] = os.environ.get(self.ENV_USER_AGENT)
-
-        if not push_key_env:
-            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_PUSH_KEY}' 未设置。")
-            self.push_key = ""
-        else:
-            self.push_key = push_key_env
 
         if not raw_cookies_env:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_COOKIES}' 未设置。")
@@ -250,7 +234,6 @@ GLaDOS 的反自动化校验会比对「签到请求的平台」与「登录时�
 
         logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.cookies_list)} 个 Cookie 用于签到。")
         self._validate_cookies()
-        logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
 
         if verbose_env is not None:
@@ -626,48 +609,6 @@ class CheckinResult:
         return result_dict
 
 
-class PushService:
-    """推送服务"""
-
-    # 由 workflow 注入: 今天已经报过一次失败, 本次不要重复推送。
-    # 判据是 GitHub 运行记录里「北京时间今天」是否已有失败的运行 ——
-    # 失败的一天里每个槽位都会失败, 不去重就会一天刷 4 条。
-    ENV_FAILURE_ALREADY_REPORTED = "GLADOS_FAILURE_ALREADY_REPORTED"
-
-    def __init__(self, config: Optional[Config] = None):
-        self.config = config
-
-    @property
-    def push_key(self) -> str:
-        """推送密钥, 配置缺失时视为未设置。"""
-        return getattr(self.config, "push_key", "") or ""
-
-    @property
-    def failure_already_reported(self) -> bool:
-        """今天是否已经推送过失败通知。"""
-        raw = os.environ.get(self.ENV_FAILURE_ALREADY_REPORTED, "")
-        return raw.strip().lower() in ("1", "true", "yes", "on")
-
-    def send(self, title: str, content: str) -> bool:
-        """发送推送。今天已经推过一次失败通知时不再重复发送。"""
-        if not self.push_key:
-            logger.info(f"{LogEmoji.WARNING} 未设置推送密钥，跳过推送通知。")
-            return False
-
-        if self.failure_already_reported:
-            logger.info(f"{LogEmoji.INFO} 今天已经推送过失败通知，跳过本次推送。")
-            return False
-
-        try:
-            pushdeer = PushDeer(pushkey=self.push_key)
-            pushdeer.send_text(title, desp=content)
-            logger.info(f"{LogEmoji.SUCCESS} 推送通知发送成功。")
-            return True
-        except Exception as e:
-            logger.error(f"{LogEmoji.ERROR} 发送推送通知失败: {e}")
-            return False
-
-
 class Checker:
     """签到"""
 
@@ -762,8 +703,8 @@ class Checker:
             if idx not in succeeded
         ]
 
-    def format_results(self) -> Tuple[str, str, str]:
-        """格式化结果"""
+    def format_results(self) -> Tuple[str, str]:
+        """格式化结果, 返回 (总结标题, 逐条明细)。"""
         results = self.get_results()
 
         success_count = sum(1 for r in results if r["code"] == CheckinStatus.SUCCESS)
@@ -772,21 +713,18 @@ class Checker:
 
         title = f"GLaDOS 签到, 成功{success_count}, 失败{fail_count}, 重复{repeat_count}"
 
-        send_content_lines = []
         log_content_lines = []
         for i, res in enumerate(results, 1):
-            line = f"#{i} P:{res['points']} 剩余:{res['days']} 总积分:{res['points_total']} | {res['status']} | {res['exchange']}"
-            send_content_lines.append(line)
-
             if self.config.verbose:
-                log_line = line
+                log_line = (
+                    f"#{i} P:{res['points']} 剩余:{res['days']} "
+                    f"总积分:{res['points_total']} | {res['status']} | {res['exchange']}"
+                )
             else:
                 log_line = f"#{i} {res['status']}"
             log_content_lines.append(log_line)
 
-        content = "\n".join(send_content_lines)
-        log_content = "\n".join(log_content_lines)
-        return title, content, log_content
+        return title, "\n".join(log_content_lines)
 
 
 # 初始化日志
@@ -794,9 +732,12 @@ logger = init_logger()
 
 
 def main() -> int:
-    """主函数, 返回进程退出码 (0 成功 / 1 签到失败 / 2 配置错误)。"""
+    """主函数, 返回进程退出码 (0 成功 / 1 签到失败 / 2 配置错误)。
+
+    通知方式: 靠退出码让 GitHub Actions 变红, 由 GitHub 发失败邮件。
+    脚本自己不做任何推送。
+    """
     exit_code = EXIT_OK
-    config: Optional[Config] = None
 
     try:
         # 1. 加载配置
@@ -805,7 +746,6 @@ def main() -> int:
 
         if not config.cookies_list:
             logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie, 退出程序。")
-            title, content = "# 未找到 cookies!", ""
             exit_code = EXIT_CONFIG_ERROR
         else:
             # 2. 执行签到
@@ -813,9 +753,9 @@ def main() -> int:
             checker = Checker(config)
             checker.checkin_all()
 
-            # 3. 格式化结果
-            logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
-            title, content, log_content = checker.format_results()
+            # 3. 汇总结果
+            logger.info(f"{LogEmoji.START} 步骤 3: 汇总结果")
+            title, log_content = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
             failed_indexes = checker.failed_cookie_indexes()
@@ -833,16 +773,8 @@ def main() -> int:
 
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
-        title, content, log_content = "# 脚本执行出错", str(e), str(e)
         exit_code = EXIT_CHECKIN_FAILED
 
-    # 4. 发送推送 (只在失败时通知, 避免正常签到天天刷屏)
-    logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config)
-    if exit_code == EXIT_OK:
-        logger.info(f"{LogEmoji.INFO} 签到正常，不发送推送 (只在失败时通知)。")
-    else:
-        push_service.send(title, content)
     logger.info(f"{LogEmoji.END} 签到完成 (退出码 {exit_code})")
     return exit_code
 

@@ -1,210 +1,164 @@
-# Glados自动签到
+# GLaDOS 自动签到
 
-## 食用方式：
+个人自用：用 GitHub Actions 每天定时跑一次 `checkin.py`，给 GLaDOS（`glados.cloud`
+或 `railgun.info`）签到。**签到失败时让作业变红，靠 GitHub 的失败邮件收到通知。**
 
-### 注册一个GLaDOS的账号([注册地址](https://glados.space/landing/0A58E-NV28S-6U3QV-33VMG))
+| 文件 | 作用 |
+|---|---|
+| `checkin.py` | 签到脚本（唯一入口） |
+| `logging_config.py` | 日志配置 |
+| `.github/workflows/gladosCheck.yml` | 定时任务 |
+| `tests/test_checkin.py` | 测试 |
 
-#### 我的邀请码：([0A58E-NV28S-6U3QV-33VMG](https://0a58e-nv28s-6u3qv-33vmg.glados.space)) 
+## 它每天是怎么跑的
 
-#### 我的优惠码（9折）：([DEVILSTORE](https://0a58e-nv28s-6u3qv-33vmg.glados.space)) 
+**一天 4 个槽位，北京时间 00:07 / 06:23 / 12:41 / 18:13。**
 
-### **Fork**本仓库
+之所以要 4 个，是因为 GitHub 的 `schedule` 是 best-effort：文档明确说高负载时会延迟
+甚至丢弃，而且 2026-08 底起还有大范围漂移。本仓库实测：计划的时间点，实际会迟到 3~10
+小时；同一份配置用「手动触发」则是秒级启动。所以用多个槽位互相兜底。
 
-![图片加载失败](imgs/1.png)
+**一天只需要成功一次，第一个成功的槽位签到，后面的槽位直接跳过**，不会重复签到。
+判据不是额外存的状态，而是 GitHub 自己的运行记录：北京时间「今天」本工作流有没有
+成功运行过。脚本是 fail-closed 的（只有签到成功 `code 0` / 重复签到 `code 1` 才退出 0），
+所以「今天有成功运行」等价于「今天已经签到成功」。
 
-### 添加**secret**
+两个细节：
 
-1. 跳转至自己的仓库的`Settings`->`Secrets and variables`->`Action`
+- **手动触发（Actions 页面点 Run workflow）不跳过**，方便排查问题时立刻跑一次。
+- 查询运行记录失败时一律**回退为照常签到** —— 宁可多签一次，也不会静默漏签。
 
-2. 添加1个`repository secret`，命名为`GLADOS_COOKIES`，其值对应你账号所在站点的cookie值中的有效部分（获取方式如下）
+另外工作流还有两个收尾步骤：`liskin/gh-workflow-keepalive` 防止 GitHub 因长期不活动
+自动停用定时任务；`Mattraks/delete-workflow-runs` 保留 30 天运行记录（排查漂移要看
+连续多天的实际触发时间，删太早会失去证据）。
 
-- 在**你注册的那个站点**（[glados.cloud](https://glados.cloud) 或 [railgun.info](https://railgun.info)）的签到页面按`F12`
+## 配置
 
-- 切换到`Network`页面下，刷新
+在仓库 `Settings` → `Secrets and variables` → `Actions` 里添加：
 
-![图片加载失败](imgs/2.png)
+| Secret | 必填 | 说明 |
+|---|---|---|
+| `GLADOS_COOKIES` | 是 | 账号的会话 Cookie，见下 |
+| `GLADOS_USER_AGENT` | **强烈建议** | 登录浏览器的 `navigator.userAgent`，见下 |
+| `GLADOS_EXCHANGE_PLAN` | 否 | 积分兑换策略，默认 `plan500` |
+| `GLADOS_VERBOSE` | 否 | `true` / `false`，默认 `false` |
 
-- 点击第一个选项卡后在`Request Headers`下找到`Cookie`，右键复制cookie的值即可
+### GLADOS_COOKIES
 
-  > **每个站点各有一套会话字段（2026-09 起）：**
-  >
-  > | 你的账号在 | `GLADOS_COOKIES` 里要带的字段 | 参考格式 |
-  > |---|---|---|
-  > | GLaDOS (`glados.cloud`) | `gld:sess` + `gld:sess.sig` | `gld:sess=eyJ1c2...; gld:sess.sig=xxxx` |
-  > | Railgun (`railgun.info`) | `koa:sess` + `koa:sess.sig` | `koa:sess=eyJ1c2...; koa:sess.sig=xxxx` |
-  > | 两个站点都有账号 | 两对都带（用 `;` 连接） | `koa:sess=...; koa:sess.sig=...; gld:sess=...; gld:sess.sig=...` |
-  >
-  > ⚠️ 只要**有一对完整**就能签到：脚本会把同一份 Cookie 依次发给两个域名，
-  > 不持有你账号的那个域名返回 `code -2` 是正常现象。
-  > 最简单的做法是在 `Network` 里右键 `Cookie` → 复制完整值，不要手工挑字段。
+在**你注册的那个站点**（`glados.cloud` 或 `railgun.info`）的签到页面按 `F12` →
+`Network` → 刷新 → 点第一个请求 → `Request Headers` 里的 `Cookie` → 右键复制完整值。
 
-![图片加载失败](imgs/3.png)
+2026-09 起每个站点各有一套会话字段，**只要有一对完整就能签到**：
 
-- 多账号请在 `COOKIES` 中 添加多个 `cookies` 中间使用 `&`连接即可。（例如： `c1&c3&c3...`）
+| 你的账号在 | 需要在 `GLADOS_COOKIES` 里带的字段 |
+|---|---|
+| GLaDOS（`glados.cloud`） | `gld:sess` + `gld:sess.sig` |
+| Railgun（`railgun.info`） | `koa:sess` + `koa:sess.sig` |
+| 两个站点都有账号 | 两对都带，用 `;` 连接 |
 
-3. 配置积分兑换策略（非必须）
+脚本会把同一份 Cookie 依次发给两个域名，**不持有你账号的那个域名返回 `code -2` 是正常现象**，
+不算失败。最简单的做法是直接复制完整的 `Cookie` 值，不要手工挑字段。
 
-- 添加1个`repository secret`，命名为`GLADOS_EXCHANGE_PLAN`，配置自动兑换积分策略：
+多账号之间用 `&` 连接：`c1&c2&c3`。每个账号只要在自己那个站点签到成功就算成功。
 
-| 值 | 积分要求 | 兑换天数 |
-|---|---------|---------|
-| `plan100` | 100 积分 | 10 天 |
-| `plan200` | 200 积分 | 30 天 |
-| `plan500` | 500 积分 | 100 天 (默认) |
+### GLADOS_USER_AGENT
 
-> 不配置时默认为 `plan500`，即积分达到 500 时自动兑换 100 天
+GLaDOS 从 2026-09 起会校验「签到请求的平台」与「登录时浏览器的平台」是否一致，
+**对不上就返回 `code 4 Automated check-in detected`**，表现为一直签到失败，但
+`status` / `points` 接口都正常，很容易误判成 Cookie 坏了。
 
-4. 手机推送（非必须）
+在**登录 GLaDOS 的那个浏览器**里按 `F12` → `Console`，执行 `navigator.userAgent`，
+把输出原样粘成这个 secret 的值。
 
-- 添加1个`repository secret`，命名为`PUSHDEER_SENDKEY`，其值对应 PushDeer key: ([获取地址](https://www.pushdeer.com/product.html))。
+> 不配置时会用脚本内置的 macOS Chrome UA。同一次实测里 macOS UA 能签到，
+> Windows / Linux / iPhone UA 一律被判为自动签到（只改 Chrome 版本号无效）。
+> 所以**在 Windows 或 Linux 上登录的话，这一项必须配**。
 
-推送只在**签到失败**时发送，签到正常不会推送；同一天多次失败也只推第一条（依据 GitHub
-运行记录判断今天是否已经报过），所以一天最多一条，不会因为一天有多个定时槽位而刷屏。
+### GLADOS_EXCHANGE_PLAN
 
-5. User-Agent（**强烈建议配置**）
+积分够就自动兑换成天数，不配置时默认 `plan500`：
 
-GLaDOS 从 2026-09 起会校验「签到请求的平台」和「登录时浏览器的平台」是否一致，**对不上就会返回
-`code 4 Automated check-in detected`**，表现为 Actions 里一直签到失败，但 `status`/`points` 接口都正常，
-很容易被误以为是 Cookie 坏了。
+| 值 | 需要积分 | 兑换天数 |
+|---|---|---|
+| `plan100` | 100 | 10 天 |
+| `plan200` | 200 | 30 天 |
+| `plan500` | 500 | 100 天（默认） |
 
-- 添加1个`repository secret`，命名为`GLADOS_USER_AGENT`
-- 在**登录 GLaDOS 的那个浏览器**里按 `F12` → `Console`，执行：
+## 通知与退出码
 
-  ```js
-  navigator.userAgent
-  ```
+脚本不做任何推送。通知链路只有一条：**签到失败 → 非 0 退出码 → 作业变红 →
+GitHub 发失败邮件**。所以别关掉 Actions 的失败通知：
 
-- 把输出的完整字符串原样粘贴为 secret 的值
+- 仓库页右上角 `Watch` → 至少勾上 `Actions`
+- `Settings` → `Notifications` → `Actions` 段选 **Send notifications for failed workflows only**
 
-> 不配置时会使用脚本内置的 macOS Chrome UA。同一次实测中：macOS UA 可以签到，
-> Windows / Linux / iPhone UA 一律被判定为自动签到（只改 Chrome 版本号无效）。
-> 所以**如果你是在 Windows 或 Linux 上登录的，这一项必须配置**。
->
-> 平台为什么是关键：账号页面「登录设备」列表调用的 `/api/user/sessions` 里，
-> `device` 字段只取 `macOS` / `Windows` / `Linux` / `Android` / `iOS` / `Bot` / `Other`，
-> 服务端就是拿它和签到请求的平台比对的（详见下面「签到请求和网页点签到的一致性」）。
+| 退出码 | 含义 |
+|---|---|
+| `0` | 所有账号至少在一个域名上签到成功 / 今日已签到 |
+| `1` | 有账号在所有域名上都没签到成功 → 作业变红 |
+| `2` | 配置错误，例如没设 `GLADOS_COOKIES` |
 
-### **star**自己的仓库
+判定是 fail-closed 的：只有 `code 0`（签到成功）和 `code 1`（重复签到）算通过；
+认证失败、反自动化拦截、网络失败、未预期异常**全部**返回 1。
 
-![图片加载失败](imgs/4.png)
+## 出问题了怎么看
 
-## 文件结构
+去 Actions 里点开最近一次 `gladosCheck` 运行，看 `Running checkin` 那一步的日志。
+
+| 日志现象 | 原因 | 处理 |
+|---|---|---|
+| `Cookie[n] 没有一对完整的会话字段` | 两对会话字段都不完整 | 回账号所在站点重新复制完整 Cookie |
+| `认证失败 (code -2, message: 没有权限)` | Cookie 不完整或已过期（约 30 天），或复制成了另一个站点的 Cookie | 重新登录复制；这行前面会提示该域名需要哪一对字段 |
+| `签到被判定为自动签到` / `code 4` | 请求的平台和登录浏览器不一致 | 按上文配置 `GLADOS_USER_AGENT`；日志里会打印服务端给的 `reason` / `loginDevice` / `currentDevice` |
+| `🌐[railgun.info] ❌ { code : -2, message : No permission }` | 你的账号不在 railgun.info | 正常现象，只看有账号的那个域名是否签到成功 |
+| 作业变红，总结里 `失败2` | 该账号所有域名都没签到成功 | 按上面依次检查 Cookie 和 `GLADOS_USER_AGENT` |
+
+日志时间戳是 **UTC**（runner 的时区），和 GitHub 日志每行自带的时间前缀一致。
+北京时间 = UTC + 8。
+
+## 本地跑
 
 ```shell
-│  checkin.py	# 签到脚本
-│  logging_config.py	# 日志配置
-│
-├─.github
-│  └─workflows
-│          gladosCheck.yml	# Actions 配置文件
-│
-└─tests
-       test_checkin.py	# 测试
-       fixtures
-              browser_checkin_request.json	# 真机抓包的签到请求, 作为请求形态的期望值
+python3 -m venv .venv && ./.venv/bin/pip install -r requirements-dev.txt
+
+# 单元测试 + 真实接口端到端测试
+./.venv/bin/python -m pytest tests/ -q
+
+# 用你自己的 Cookie 本地跑一次（不会打印 Cookie 值）
+GLADOS_COOKIES='gld:sess=...; gld:sess.sig=...' \
+GLADOS_USER_AGENT='粘贴你浏览器的 navigator.userAgent' \
+./.venv/bin/python checkin.py; echo "exit=$?"
 ```
 
-## 更新日志
+注意 `重复签到` 也是成功：`code : 1 ... observation logged` 表示服务端接受了这次请求。
 
-- **2026-01**: 重构代码，添加log输出方便定位，支持新版网址，支持配置积分兑换策略。
-- **2026-04**: 优化代码逻辑，优化日志输出，支持[新版域名](https://railgun.info) ，在 GLADOS_COOKIES 中添加新版域名下的 cookies 即可使用。
-- **2026-09**: GLaDOS 连续改了两处：
-  1. 会话 Cookie 拆成两套：`glados.cloud` 用 `gld:sess` / `gld:sess.sig`，
-     `railgun.info` 用 `koa:sess` / `koa:sess.sig`。只在一个站点注册时，只复制
-     那个站点的那一对即可；两个站点都有账号时两对都带上。
-  2. 新增反自动化校验：签到请求的平台必须与登录浏览器一致，否则返回
-     `code 4 Automated check-in detected`（回复里还会带 `reason: device-mismatch`
-     和 `loginDevice`/`currentDevice`，站点自己也是让用户重新登录来重置设备）。
-  3. 脚本的请求形态与网页端逐项对齐（做法见下面「签到请求和网页点签到的一致性」）：
-     站点 console 包里签到走的是 `axios.post("/user/checkin", {token: location.hostname})`
-     （baseURL 为 `/api`），所以脚本现在发**紧凑 JSON 请求体**
-     （`{"token":"<域名>"}`、`{"planType":...}`，与浏览器的 `JSON.stringify` 逐字节一致）、
-     `content-type: application/json;charset=UTF-8`，并且**不再自己造 `referer`**——
-     签到页带 `<meta name="referrer" content="no-referrer">`，浏览器根本不发这个头。
+## 为什么请求要长得像浏览器
 
-  脚本现在会在加载阶段校验 Cookie 字段、在认证失败 (code -2) 与被判定为自动签到 (code 4) 时
-  分别给出可操作提示，并在**账号在所有域名上都失败时返回非 0 退出码**，
-  让 Actions 真正变红，不再出现“工作流成功但没签到”的假绿。
+被判定为自动签到（`code 4`）的根因是「请求不像本人浏览器点的」。这里不是猜的，是拿真机
+抓包逐项对齐的 —— 期望值存在 [`tests/fixtures/browser_checkin_request.json`](tests/fixtures/browser_checkin_request.json)：
+2026-09-26 用 CDP 记录本机 Chrome 154（macOS）在 `https://glados.cloud/console/checkin`
+点「签到」时发出的那一次请求。
 
-
-## 签到请求和网页点签到的一致性
-
-被判定为自动签到 (code 4) 的根因是「请求长得不像本人浏览器点的」。这里的请求形态是拿真机
-抓包逐项对齐的，期望值存在 [`tests/fixtures/browser_checkin_request.json`](tests/fixtures/browser_checkin_request.json)：
-2026-09-26 用 CDP 记录本机 Chrome 154 (macOS) 在 `https://glados.cloud/console/checkin`
-点击「签到」时发出的那一次请求（含浏览器自动加的 `sec-ch-ua*` / `sec-fetch-*` 等头）。
-
-| 项目 | 浏览器的签到请求 | 脚本 |
+| 项目 | 浏览器 | 脚本 |
 |---|---|---|
 | 方法 / 路径 | `POST /api/user/checkin` | 一致 |
 | 请求体 | `{"token":"glados.cloud"}`（24 字节，无空格） | 一致 |
 | `content-type` | `application/json;charset=UTF-8` | 一致 |
 | `accept` | `application/json, text/plain, */*` | 一致 |
 | `origin` | `https://glados.cloud` | 一致 |
-| `user-agent` | 登录时那个浏览器的 UA | 一致（默认就是它，可用 `GLADOS_USER_AGENT` 覆盖） |
-| `referer` | **没有**（页面是 `no-referrer`） | 不发 |
+| `user-agent` | 登录时那个浏览器 | 一致（默认内置，可用 `GLADOS_USER_AGENT` 覆盖） |
+| `referer` | **没有**（签到页是 `no-referrer`） | 不发 |
 | `sec-ch-ua*` / `sec-fetch-*` / `accept-language` / `dnt` | 浏览器进程自动加 | 刻意不伪造 |
 
-最后一行是故意的：伪造 `sec-ch-ua-platform` 这类值，一旦用户的实际浏览器平台和
-`GLADOS_USER_AGENT` 对不上，反而制造出「UA 与 client hints 打架」这种更像机器人的特征；
-实测缺了这些头服务端照样接受（返回 `code 1`）。
+最后一行是故意的：伪造 `sec-ch-ua-platform` 这类值，一旦和用户真实浏览器对不上，反而制造出
+「UA 与 client hints 打架」这种更像机器人的特征；实测缺了这些头服务端照样接受。
 
-服务端判「自动签到」的依据，是比对**登录设备平台**和**本次请求的平台**：账号页面调用的
-`/api/user/sessions` 里 `device` 只会是 `macOS` / `Windows` / `Linux` / `Android` / `iOS` /
-`Bot` / `Other` 之一，正是从 User-Agent 里解析出来的。所以只要 `GLADOS_USER_AGENT` 是
-**当初登录的那个浏览器**的 `navigator.userAgent`，平台就对得上。
+服务端判定依据是**登录设备平台**：账号页面的 `/api/user/sessions` 里 `device` 只会是
+`macOS` / `Windows` / `Linux` / `Android` / `iOS` / `Bot` / `Other`，正是从 User-Agent
+解析出来的。所以只要 `GLADOS_USER_AGENT` 是当初登录那个浏览器的 `navigator.userAgent`，
+平台就对得上。
 
-想自己复核：在浏览器里点一次签到，`F12` → `Network` → 右键该请求 → `Copy as cURL`，
-再和 `tests/test_checkin.py` 里 `test_checkin_wire_request_matches_the_captured_browser_request`
-与 `test_checkin_sends_no_header_the_browser_never_sends` 的断言对一遍即可。
+## 说明
 
-
-## 问题排查与定位
-- 大家可以通过查询 actions 中的 running checkin 日志快速定位问题，有其他问题提交issue。
-
-  <img width="1684" height="844" alt="image" src="https://github.com/user-attachments/assets/45348a5f-43e4-45f5-8fdf-ce84d343b30d" />
-
-### 常见报错对照
-
-| 日志现象 | 原因 | 处理方式 |
-|---|---|---|
-| `Cookie[n] 没有一对完整的会话字段` | Cookie 里 `gld:sess`/`gld:sess.sig` 与 `koa:sess`/`koa:sess.sig` 两对都不完整 | 回到你账号所在站点的 `F12` → `Network`，右键 `Cookie` 复制完整值；只复制其中一个站点的那一对也够用 |
-| `认证失败 (code -2, message: 没有权限)` | Cookie 不完整或已过期（约 30 天），或复制的是另一个站点的 Cookie | 重新登录账号所在站点复制完整 Cookie；本行前面会提示该域名需要哪一对字段 |
-| `签到被判定为自动签到` / `code 4 Automated check-in detected` | 请求的 User-Agent 平台与登录浏览器不一致（日志里会跟着打印服务端给的 `reason` / `loginDevice` / `currentDevice`） | 按上面第 5 步配置 `GLADOS_USER_AGENT` 为你的 `navigator.userAgent`；`currentDevice` 就是这次请求被识别成的平台，`loginDevice` 是登录时那个 |
-| `任务 x/y: 🍪[n] on 🌐[railgun.info] ❌ { code : -2, message : No permission }` | 该账号不在 railgun.info，属正常现象 | 无需处理，只看有账号的那个域名是否签到成功 |
-| Actions 变红，总结里 `失败2` | 该账号所有域名都没签到成功 | 按上面的提示依次检查 Cookie 和 `GLADOS_USER_AGENT` |
-
-
-### 退出码约定
-
-| 退出码 | 含义 |
-|---|---|
-| `0` | 所有账号至少在其中一个域名上签到成功 / 今日已签到 |
-| `1` | 有账号在所有域名上都未签到成功 → Actions 变红 |
-| `2` | 配置错误，例如未设置 `GLADOS_COOKIES` |
-
-### 本地自测
-
-```shell
-python3 -m venv .venv && ./.venv/bin/pip install -r requirements-dev.txt
-# 单元测试 + 真实接口端到端测试
-./.venv/bin/python -m pytest tests/ -q
-# 用你自己的 Cookie 本地跑一次（不会打印 Cookie 值）
-# glados.cloud 账号用 gld:sess/gld:sess.sig，railgun.info 账号用 koa:sess/koa:sess.sig
-GLADOS_COOKIES='gld:sess=...; gld:sess.sig=...' \
-GLADOS_USER_AGENT='粘贴你浏览器的 navigator.userAgent' \
-./.venv/bin/python checkin.py; echo "exit=$?"
-```
-
-> `重复签到` 也是成功（当天已经签过），日志里的 `code : 1 ... observation logged` 表示服务端接受了这次请求。
-
-## 声明
-
-本项目不保证稳定运行与更新, 因GitHub相关规定可能会删库, 请注意备份
-
-
-
-
-
-
-
+本项目基于 [Devilstore/Glados-Railgun-checkin](https://github.com/Devilstore/Glados-Railgun-checkin)
+修改，遵循仓库内的 [LICENSE](LICENSE)。

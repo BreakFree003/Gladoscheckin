@@ -32,12 +32,6 @@ BOTH_SITES_COOKIE = f"{GLADOS_SITE_COOKIE}; {RAILGUN_SITE_COOKIE}"
 INCOMPLETE_SESSION_COOKIE = f"gld:sess={COOKIE_SENTINEL}_gsess; theme=dark"
 # 完全不像 Cookie 的输入
 NON_COOKIE_INPUT = f"not-a-cookie={COOKIE_SENTINEL}"
-# push key 同样是凭据, 用可识别的哨兵值; 只为让 PushService 走到「真正发送」那一步
-PUSH_KEY_SENTINEL = "SENTINEL_PUSH_KEY_MUST_NOT_BE_LOGGED"
-# workflow 注入给脚本的线协议名。这里刻意写死不引用 checkin 的常量:
-# 只改动脚本这边的名字而忘了改 workflow 时, 这些用例必须变红。
-FAILURE_ALREADY_REPORTED_ENV = "GLADOS_FAILURE_ALREADY_REPORTED"
-
 
 # --------------------------------------------------------------------------
 # Cookie 结构解析
@@ -313,7 +307,6 @@ def test_api_get_requests_carry_no_content_type_or_referer(monkeypatch):
 
 def _config_with_cookie(monkeypatch, cookie: str, user_agent=None) -> checkin.Config:
     monkeypatch.setenv(checkin.Config.ENV_COOKIES, cookie)
-    monkeypatch.delenv(checkin.Config.ENV_PUSH_KEY, raising=False)
     if user_agent is None:
         monkeypatch.delenv(checkin.Config.ENV_USER_AGENT, raising=False)
     else:
@@ -322,7 +315,7 @@ def _config_with_cookie(monkeypatch, cookie: str, user_agent=None) -> checkin.Co
 
 
 def _assert_no_cookie_warning(caplog, cookie: str) -> None:
-    """加载期不应出现任何针对 Cookie 字段的告警 (推送密钥之类的告警不算)。"""
+    """加载期不应出现任何针对 Cookie 字段的告警 (未配置兑换计划之类的告警不算)。"""
     text = caplog.text
     assert "会话字段" not in text, text
     assert cookie not in text
@@ -454,7 +447,6 @@ def _stub_api(monkeypatch):
         }
 
     monkeypatch.setattr(checkin.API, "checkin", fake_checkin)
-    monkeypatch.delenv(checkin.Config.ENV_PUSH_KEY, raising=False)
     return state
 
 
@@ -484,62 +476,6 @@ def test_main_returns_2_when_cookie_env_is_missing(monkeypatch, _stub_api):
     assert checkin.main() == checkin.EXIT_CONFIG_ERROR
 
 
-
-
-@pytest.fixture()
-def _recorded_pushes(monkeypatch, _stub_api):
-    """替换 PushDeer 这个外部边界, 记录真正发出去的推送。
-
-    依赖 _stub_api 只为固定顺序: 它会把 push key 清掉, 这里再设置回来。
-    """
-    sent = []
-
-    class _RecordingPushDeer:
-        def __init__(self, pushkey):
-            self.pushkey = pushkey
-
-        def send_text(self, title, desp=None):
-            sent.append((title, desp))
-            return True
-
-    monkeypatch.setattr(checkin, "PushDeer", _RecordingPushDeer)
-    monkeypatch.setenv(checkin.Config.ENV_PUSH_KEY, PUSH_KEY_SENTINEL)
-    monkeypatch.delenv(FAILURE_ALREADY_REPORTED_ENV, raising=False)
-    return sent
-
-
-def test_main_does_not_push_when_checkin_succeeds(monkeypatch, _stub_api, _recorded_pushes):
-    """需求: 推送只在失败时发送。正常签到也推会变成天天刷屏, 把真正的告警淹没。"""
-    monkeypatch.setenv(checkin.Config.ENV_COOKIES, BOTH_SITES_COOKIE)
-
-    assert checkin.main() == checkin.EXIT_OK
-    assert _recorded_pushes == []
-
-
-def test_main_pushes_when_checkin_fails(monkeypatch, _stub_api, _recorded_pushes):
-    """失败模式: 签到失败必须推送一次 —— 否则「只在失败时推」会退化成永远不推。"""
-    monkeypatch.setenv(checkin.Config.ENV_COOKIES, BOTH_SITES_COOKIE)
-    _stub_api["checkin_code"] = checkin.CheckinStatus.FAILURE
-
-    assert checkin.main() == checkin.EXIT_CHECKIN_FAILED
-    assert len(_recorded_pushes) == 1
-
-
-def test_main_does_not_push_again_when_failure_already_reported_today(
-    monkeypatch, _stub_api, _recorded_pushes
-):
-    """需求: 失败一天最多推一条。但退出码必须仍是失败 —— 去重不能顺手把红色也去掉。"""
-    monkeypatch.setenv(checkin.Config.ENV_COOKIES, BOTH_SITES_COOKIE)
-    monkeypatch.setenv(FAILURE_ALREADY_REPORTED_ENV, "true")
-    _stub_api["checkin_code"] = checkin.CheckinStatus.FAILURE
-
-    assert checkin.main() == checkin.EXIT_CHECKIN_FAILED
-    assert _recorded_pushes == []
-
-
-def test_push_service_without_config_does_not_raise():
-    """失败模式: Config() 抛异常时旧代码用 "" 兜底, 会在推送阶段再抛一次异常。"""
-    assert checkin.PushService(None).send("title", "content") is False
 
 
 def test_api_checkin_reports_failure_when_request_raises(monkeypatch):
@@ -631,7 +567,6 @@ def test_api_checkin_automation_hint_still_works_without_device_fields(monkeypat
 def _run_checkin(env_overrides: dict) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env.pop(checkin.Config.ENV_COOKIES, None)
-    env.pop(checkin.Config.ENV_PUSH_KEY, None)
     env.pop(checkin.Config.ENV_USER_AGENT, None)
     env.update(env_overrides)
 
@@ -671,24 +606,3 @@ def test_e2e_missing_cookie_env_exits_with_config_error():
 
     assert proc.returncode == checkin.EXIT_CONFIG_ERROR, proc.stdout + proc.stderr
     assert "未找到有效的 Cookie" in proc.stderr
-
-
-def test_e2e_failure_with_already_reported_flag_skips_push_but_still_exits_nonzero():
-    """端到端: 带上「今天已报过」标记再失败一次, 必须跳过推送, 但退出码仍是 1。
-
-    用哨兵 push key, 正常情况下这个 key 根本不会被用到 (在构造 PushDeer 之前就返回了),
-    所以这条用例不会真的打到 PushDeer。
-    """
-    proc = _run_checkin(
-        {
-            checkin.Config.ENV_COOKIES: RAILGUN_SITE_COOKIE,
-            checkin.Config.ENV_PUSH_KEY: PUSH_KEY_SENTINEL,
-            FAILURE_ALREADY_REPORTED_ENV: "true",
-        }
-    )
-
-    combined = proc.stdout + proc.stderr
-    assert proc.returncode == checkin.EXIT_CHECKIN_FAILED, combined
-    assert "今天已经推送过失败通知" in combined
-    assert "推送通知发送成功" not in combined
-    assert PUSH_KEY_SENTINEL not in combined
