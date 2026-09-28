@@ -3,8 +3,10 @@ name: auto check
 on:
   workflow_dispatch:
   push:
-    # 默认分支是 master, 不是 main。写成 main 会让 push 触发完全不生效。
-    branches: [ master ]
+    # 默认分支已由 master 改名为 main。这里改回 main 后才与分支名一致。
+    # (历史教训: 2023-08-17 建文件起这里一直写 [main], 而仓库实际分支叫 master,
+    #  导致 push 触发从未生效 —— 历史 27 次运行里 push 事件 0 次。)
+    branches: [ main ]
     paths-ignore:
       - 'README.md'
       - 'imgs/**'
@@ -63,10 +65,15 @@ jobs:
         # GLaDOS 会校验签到请求的平台是否与登录浏览器一致, 平台不符会被判定为自动签到 (code 4)
         GLADOS_USER_AGENT: ${{ secrets.GLADOS_USER_AGENT }}
 
+    # 签到失败时, 这两个收尾步骤也要照跑:
+    # 用 if: always() 保证 keepalive 不会因为签到红了就被跳过, 否则工作流可能被
+    # GitHub 判定为长期不活动而自动停用。作业本身仍会因为上面步骤失败而保持红色。
     - name: Keep alive
+      if: always()
       uses: liskin/gh-workflow-keepalive@v1 
         
     - name: Delete workflow runs
+      if: always()
       uses: Mattraks/delete-workflow-runs@v2
       with:
         token: ${{ github.token }}
