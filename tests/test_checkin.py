@@ -31,8 +31,6 @@ INCOMPLETE_SESSION_COOKIE = f"gld:sess={COOKIE_SENTINEL}_gsess; theme=dark"
 LEGACY_FIELDS_ONLY_COOKIE = f"koa:sess={COOKIE_SENTINEL}_sess; koa:sess.sig={COOKIE_SENTINEL}_sig"
 # 完全不像这个站点 Cookie 的输入
 NON_COOKIE_INPUT = f"not-a-cookie={COOKIE_SENTINEL}"
-# 两个账号, 用 & 分隔
-TWO_ACCOUNTS_COOKIES = f"{GLADOS_COOKIE}&{GLADOS_COOKIE}"
 
 # --------------------------------------------------------------------------
 # Cookie 结构解析
@@ -127,7 +125,7 @@ def test_api_sends_the_configured_user_agent(monkeypatch):
     config = _config_with_cookie(monkeypatch, GLADOS_COOKIE)
     config.user_agent = "UA_MUST_REACH_THE_WIRE"
 
-    assert checkin.API(1, user_agent=config.user_agent).headers["user-agent"] == (
+    assert checkin.API(user_agent=config.user_agent).headers["user-agent"] == (
         "UA_MUST_REACH_THE_WIRE"
     )
 
@@ -209,7 +207,7 @@ def test_checkin_wire_request_matches_the_captured_browser_request(monkeypatch):
     """
     capture = _browser_capture()
     browser = capture["request"]
-    api = checkin.API(1, user_agent=capture["browser"]["user_agent"])
+    api = checkin.API(user_agent=capture["browser"]["user_agent"])
 
     recorded = _capture_request(
         monkeypatch,
@@ -238,7 +236,7 @@ def test_checkin_sends_no_header_the_browser_never_sends(monkeypatch):
     # HTTP/1.1 客户端自带、而浏览器走 h2 时不会出现的两个头
     client_only = {"host", "connection"}
 
-    api = checkin.API(1)
+    api = checkin.API()
     recorded = _capture_request(
         monkeypatch, {"code": 1, "message": "repeat"}, lambda: api.checkin(GLADOS_COOKIE)
     )
@@ -251,7 +249,7 @@ def test_checkin_sends_no_header_the_browser_never_sends(monkeypatch):
 
 def test_api_exchange_posts_compact_json_plan_type_like_the_web_console(monkeypatch):
     """失败模式: 兑换请求体不是网页端那种紧凑 JSON, 或少了 content-type。"""
-    api = checkin.API(1)
+    api = checkin.API()
 
     recorded = _capture_request(
         monkeypatch, {"code": 0, "message": "ok"},
@@ -265,7 +263,7 @@ def test_api_exchange_posts_compact_json_plan_type_like_the_web_console(monkeypa
 
 def test_api_get_requests_carry_no_content_type_or_referer(monkeypatch):
     """失败模式: 把 POST 才有的 content-type 也塞给 GET, 与浏览器不一致。"""
-    api = checkin.API(1)
+    api = checkin.API()
 
     recorded = _capture_request(
         monkeypatch,
@@ -312,7 +310,7 @@ def test_config_accepts_complete_cookie_without_warning(monkeypatch, caplog):
     with caplog.at_level("INFO"):
         config = _config_with_cookie(monkeypatch, GLADOS_COOKIE)
 
-    assert config.cookies_list == [GLADOS_COOKIE]
+    assert config.cookie == GLADOS_COOKIE
     _assert_no_config_warning(caplog, GLADOS_COOKIE)
 
 
@@ -322,7 +320,7 @@ def test_config_accepts_cookie_with_extra_unrelated_fields_without_warning(monke
     with caplog.at_level("INFO"):
         config = _config_with_cookie(monkeypatch, cookie)
 
-    assert config.cookies_list == [cookie]
+    assert config.cookie == cookie
     _assert_no_config_warning(caplog, cookie)
 
 
@@ -336,7 +334,7 @@ def test_config_warns_for_cookie_with_only_legacy_fields(monkeypatch, caplog):
     with caplog.at_level("INFO"):
         config = _config_with_cookie(monkeypatch, LEGACY_FIELDS_ONLY_COOKIE)
 
-    assert config.cookies_list == [LEGACY_FIELDS_ONLY_COOKIE]
+    assert config.cookie == LEGACY_FIELDS_ONLY_COOKIE
     assert "缺少会话字段" in caplog.text
     assert "gld:sess" in caplog.text
     assert COOKIE_SENTINEL not in caplog.text
@@ -365,49 +363,28 @@ def test_config_warns_when_input_is_not_a_cookie(monkeypatch, caplog):
 
 
 # --------------------------------------------------------------------------
-# 账号维度的退出码判定
+# 退出码判定 (fail-closed)
 # --------------------------------------------------------------------------
 
 
-class _FakeConfig:
-    """仅提供 Checker 需要的字段, 避免测试依赖环境变量。"""
+def test_main_fails_closed_when_the_checkin_raises(monkeypatch, caplog):
+    """最要紧的一条约束: 拿不到"成功/重复"的结果就必须报红。
 
-    def __init__(self, cookie_count: int):
-        self.cookies_list = [f"cookie-{i}" for i in range(cookie_count)]
-        self.EXCHANGE_PLAN = checkin.Config.EXCHANGE_PLAN
-        self.EXCHANGE_PLAN_POINTS = checkin.Config.EXCHANGE_PLAN_POINTS
-
-
-def _result(cookie_index: int, code: checkin.CheckinStatus) -> checkin.CheckinResult:
-    """Checker.results 存放的就是 CheckinResult 实例 (不再有 dict 中转层)。"""
-    return checkin.CheckinResult(cookie_index, code=code)
-
-
-def test_failed_cookie_indexes_reports_only_accounts_that_did_not_succeed():
-    """失败模式: 线上 2026-09-24 起接口全返回 -2, 必须判定为账号失败。
-
-    重复签到算成功 —— 那说明当天已经签过了, 不是故障。
+    宁可多签一次, 也绝不静默漏签。中途异常是这条约束最容易破的地方 —— 异常被
+    吞掉、流程照走, 就会静默漏签还显示绿色。
     """
-    checker = checkin.Checker(_FakeConfig(cookie_count=2))
-    checker.results = [
-        _result(1, checkin.CheckinStatus.FAILURE),
-        _result(2, checkin.CheckinStatus.REPEAT),
-    ]
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
 
-    assert checker.failed_cookie_indexes() == [1]
+    def boom(config):
+        raise RuntimeError("boom")
 
+    monkeypatch.setattr(checkin, "run_checkin", boom)
 
-def test_failed_cookie_indexes_treats_a_missing_result_as_failure():
-    """失败模式: 某个账号压根没跑出结果时, 不得当成成功。
+    with caplog.at_level("ERROR"):
+        exit_code = checkin.main()
 
-    这是整个脚本最要紧的一条约束 (宁可多签一次, 也绝不静默漏签): 判据必须以
-    配置里的账号数为准, 而不是以「跑出了几条结果」为准 —— 后者在中途异常时会
-    静默漏签还显示绿色。
-    """
-    checker = checkin.Checker(_FakeConfig(cookie_count=2))
-    checker.results = [_result(1, checkin.CheckinStatus.SUCCESS)]
-
-    assert checker.failed_cookie_indexes() == [2]
+    assert exit_code == checkin.EXIT_CHECKIN_FAILED
+    assert "boom" in caplog.text
 
 
 # --------------------------------------------------------------------------
@@ -501,7 +478,7 @@ def test_a_successful_checkin_logs_neither_the_request_nor_the_cookie(monkeypatc
     不逐条回显请求/响应, 是用户明确提过的要求 (旧日志跑一次 18 行); Cookie 值不落盘
     是安全约束 —— 请求头从不进日志, 这两条都得有人守着。
     """
-    api = checkin.API(1)
+    api = checkin.API()
 
     with caplog.at_level("INFO"):
         _capture_request(
@@ -550,8 +527,8 @@ def test_a_successful_exchange_is_visible_in_the_log(monkeypatch, caplog):
     否则成功兑换这种最该知道的事, 反而在日志里什么都看不到。
     回归的就是"积分够了、兑换也成功了, 但日志里一个字都没有"这个观测盲区。
 
-    留痕的位置是每个账号的结果行 (无条件输出)。这里只换掉网络层, checkin /
-    get_points / exchange / Checker / 结果行全部走真代码 —— 把其中任何一层 stub 掉,
+    留痕的位置是结果行 (无条件输出)。这里只换掉网络层, checkin /
+    get_points / exchange / run_checkin / 结果行全部走真代码 —— 把其中任何一层 stub 掉,
     就等于在测 stub 自己。
     """
     monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
@@ -597,7 +574,7 @@ def test_exchange_uses_the_hardcoded_plan500(monkeypatch, _stub_api):
 
 def test_api_checkin_reports_failure_when_request_raises(monkeypatch):
     """失败模式: 网络异常被 log_method 兜底后必须仍是「签到失败」而不是成功。"""
-    api = checkin.API(1)
+    api = checkin.API()
 
     def boom(*args, **kwargs):
         raise checkin.requests.exceptions.ConnectionError("boom")
@@ -628,7 +605,6 @@ def test_api_checkin_hints_user_agent_when_automation_detected(monkeypatch, capl
     loginDevice / currentDevice; 脚本也要把这两个值打出来, 否则用户只能瞎试 UA。
     """
     api = checkin.API(
-        1,
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
     )
@@ -660,7 +636,7 @@ def test_api_checkin_hints_user_agent_when_automation_detected(monkeypatch, capl
 
 def test_api_checkin_automation_hint_still_works_without_device_fields(monkeypatch, caplog):
     """失败模式: 服务端只回 code 4 不带 reason/设备字段时, 提示不能崩也不能消失。"""
-    api = checkin.API(1)
+    api = checkin.API()
     monkeypatch.setattr(
         api,
         "_make_request",
@@ -712,9 +688,9 @@ def test_e2e_invalid_cookie_against_live_api_exits_nonzero_with_actionable_log()
     assert "没有权限" in proc.stderr
     # 失败提示要指名这个站点需要的会话字段
     assert "gld:sess" in combined
-    # 这里必须瞄准 main() 的账号级汇总那一句: 只写"签到失败"会被结果行
-    # "🍪[1] ⚠️  结果: 签到失败" 满足, 于是删掉整段汇总也照样绿。
-    assert "失败账号 [1]" in proc.stderr
+    # 必须瞄准 main() 收尾那一句: 只写"签到失败"会被结果行 "❌ 签到失败" 满足,
+    # 于是删掉整段收尾也照样绿。
+    assert "签到失败 (退出码 1)" in proc.stderr
     assert "请检查 Cookie 是否完整/过期" in proc.stderr
     assert COOKIE_SENTINEL not in combined
 

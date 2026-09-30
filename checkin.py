@@ -100,7 +100,7 @@ def log_method(func):
             result = func(self, *args, **kwargs)
             return result
         except Exception as e:
-            logger.error(f"[{self.cookie_index}] API {method_name} 执行失败: {e}")
+            logger.error(f"API {method_name} 执行失败: {e}")
 
             DEFAULT_ERRORS = {
                 "checkin": {"status": "签到失败", "points": "0", "message": ""},
@@ -144,7 +144,7 @@ plan100 / plan200 来自站点说明但从未在真实接口上验证过, 而 GL
     EXCHANGE_PLAN_POINTS = 500
 
     def __init__(self):
-        self.cookies_list: List[str] = []
+        self.cookie: str = ""
         self.user_agent: str = self.DEFAULT_USER_AGENT
         self._load_config()
 
@@ -153,15 +153,11 @@ plan100 / plan200 来自站点说明但从未在真实接口上验证过, 而 GL
         raw_cookies_env: Optional[str] = os.environ.get(self.ENV_COOKIES)
         user_agent_env: Optional[str] = os.environ.get(self.ENV_USER_AGENT)
 
-        if raw_cookies_env:
-            self.cookies_list = [cookie.strip() for cookie in raw_cookies_env.split("&") if cookie.strip()]
-            if not self.cookies_list:
-                raise ValueError(f"环境变量 '{self.ENV_COOKIES}' 已设置, 但未包含任何有效的 Cookie。")
+        # 只支持一个账号。以前用 "&" 拼接多个账号的写法已去掉 (见 README):
+        # 整个值当成一份 Cookie, 里面若还带着 "&" 只会让站点认不出来 -> 变红。
+        self.cookie = raw_cookies_env.strip() if raw_cookies_env else ""
 
-        logger.info(
-            f"开始签到: {len(self.cookies_list)} 个账号, "
-            f"兑换 {self.EXCHANGE_PLAN} (需 {self.EXCHANGE_PLAN_POINTS} 积分)"
-        )
+        logger.info(f"开始签到: 兑换 {self.EXCHANGE_PLAN} (需 {self.EXCHANGE_PLAN_POINTS} 积分)")
 
         if user_agent_env and user_agent_env.strip():
             self.user_agent = user_agent_env.strip()
@@ -169,25 +165,27 @@ plan100 / plan200 来自站点说明但从未在真实接口上验证过, 而 GL
         else:
             logger.info(f"User-Agent: 内置默认 (可用 {self.ENV_USER_AGENT} 覆盖为登录浏览器的 UA)")
 
-        self._validate_cookies()
+        self._validate_cookie()
 
-    def _validate_cookies(self) -> None:
+    def _validate_cookie(self) -> None:
         """校验 Cookie 结构, 只输出字段名与数量, 不输出凭据本身。
 
         只报问题: 字段齐全属于正常情况, 不值得在正常路径上空占一行。
         """
-        for idx, cookie in enumerate(self.cookies_list, 1):
-            missing = missing_cookie_keys(cookie)
-            if not missing:
-                continue
+        if not self.cookie:
+            return
 
-            present = parse_cookie_keys(cookie)
-            logger.warning(
-                f"[{idx}] Cookie 缺少会话字段 {'/'.join(missing)} "
-                f"(当前字段: {', '.join(present) if present else '无'}); "
-                f"{DOMAIN} 需要 {' 与 '.join(COOKIE_KEYS)} 两个字段, "
-                f"缺 .sig 大多是复制时被截断了, 请重新复制完整 Cookie 更新 {self.ENV_COOKIES}"
-            )
+        missing = missing_cookie_keys(self.cookie)
+        if not missing:
+            return
+
+        present = parse_cookie_keys(self.cookie)
+        logger.warning(
+            f"Cookie 缺少会话字段 {'/'.join(missing)} "
+            f"(当前字段: {', '.join(present) if present else '无'}); "
+            f"{DOMAIN} 需要 {' 与 '.join(COOKIE_KEYS)} 两个字段, "
+            f"缺 .sig 大多是复制时被截断了, 请重新复制完整 Cookie 更新 {self.ENV_COOKIES}"
+        )
 
 
 class API:
@@ -200,12 +198,7 @@ class API:
     """POST 的 content-type, 与站点前端 axios 发出的一致 (带 charset, 无空格)。"""
     CONTENT_TYPE_JSON = "application/json;charset=UTF-8"
 
-    def __init__(
-        self,
-        cookie_index: int = 0,
-        user_agent: str = Config.DEFAULT_USER_AGENT,
-    ):
-        self.cookie_index: int = cookie_index
+    def __init__(self, user_agent: str = Config.DEFAULT_USER_AGENT):
         self.user_agent: str = user_agent
         self.headers: Dict[str, str] = self._get_headers()
         self._auth_error_reported: bool = False
@@ -251,18 +244,16 @@ class API:
         }
 
     def _log(self, level: str, message: str) -> None:
-        """统一的 API 层日志 (行首 `[N]` 是账号序号)。
+        """统一的 API 层日志。
 
-        这里只输出有信息量的事件: 失败、以及会改变账号状态的动作 (兑换成功)。
-        成功的请求不再逐条回显 —— 每个账号跑完会有一行结果。
+        这里只输出有信息量的事件 (失败)。成功的请求不逐条回显 —— 跑完会有一行结果。
         """
-        log_message = f"[{self.cookie_index}] {message}"
         if level == "info":
-            logger.info(log_message)
+            logger.info(message)
         elif level == "warning":
-            logger.warning(log_message)
+            logger.warning(message)
         elif level == "error":
-            logger.error(log_message)
+            logger.error(message)
 
     def _get_full_url(self, path: str) -> str:
         """获取完整 URL"""
@@ -455,108 +446,60 @@ class API:
 
 @dataclass()
 class CheckinResult:
-    """单个账号的签到结果"""
+    """一次签到的结果"""
 
-    cookie_index: int
     status: str = "签到失败"
     points: str = "0"
     points_total: str = "None"
     exchange: str = ""
     code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
 
+    @property
+    def passed(self) -> bool:
+        """签到成功与重复签到都算通过, 其余一律算失败 (fail-closed)。"""
+        return self.code in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
 
-class Checker:
-    """签到一个或多个账号"""
-
-    def __init__(self, config: Config):
-        self.config = config
-        self.results: List[CheckinResult] = []
-
-    def _log(self, cookie_idx: int, message: str, level: str = "info") -> None:
-        """统一的账号级日志 (一行一个账号的结果)。"""
-        log_message = f"[{cookie_idx}] {message}"
-        if level == "warning":
-            logger.warning(log_message)
-        else:
-            logger.info(log_message)
-
-    def checkin_all(self) -> None:
-        """依次签到每个账号, 每个账号跑完就打一行结果。"""
-        for cookie_idx, cookie in enumerate(self.config.cookies_list, 1):
-            result = self._checkin_account(cookie, cookie_idx)
-            self.results.append(result)
-            self._log(
-                cookie_idx,
-                self._describe(result),
-                level="warning" if result.code is CheckinStatus.FAILURE else "info",
-            )
-
-    @staticmethod
-    def _describe(result: CheckinResult) -> str:
-        """把单个账号的结果拼成一行: 状态 + 本次获得 + 总积分 + 兑换情况。"""
+    def describe(self) -> str:
+        """把结果拼成一行: 状态 + 本次获得 + 总积分 + 兑换情况。"""
         emoji = {
             CheckinStatus.SUCCESS: LogEmoji.SUCCESS,
             CheckinStatus.REPEAT: LogEmoji.REPEAT,
             CheckinStatus.FAILURE: LogEmoji.FAIL,
-        }[result.code]
+        }[self.code]
 
-        line = f"{emoji} {result.status}"
-        if result.code is CheckinStatus.FAILURE:
+        line = f"{emoji} {self.status}"
+        if self.code is CheckinStatus.FAILURE:
             return line
 
         # 重复签到时没有"获得"可言, 硬写一句"获得 0 积分"看着像 bug。
-        earned = f"获得 {result.points} 积分, " if result.code is CheckinStatus.SUCCESS else ""
-        return f"{line}, {earned}总 {result.points_total}, {result.exchange}"
+        earned = f"获得 {self.points} 积分, " if self.code is CheckinStatus.SUCCESS else ""
+        return f"{line}, {earned}总 {self.points_total}, {self.exchange}"
 
-    def _checkin_account(self, cookie: str, cookie_idx: int) -> CheckinResult:
-        """一个账号的完整流程: 签到 -> 查总积分 -> 达标才兑换。"""
-        result = CheckinResult(cookie_idx)
 
-        with API(cookie_idx, user_agent=self.config.user_agent) as api:
-            # 1. 签到
-            checkin_result = api.checkin(cookie)
-            result.status = checkin_result["status"]
-            result.code = checkin_result.get("code", CheckinStatus.FAILURE)
-            result.points = checkin_result.get("points", "0")
+def run_checkin(config: Config) -> CheckinResult:
+    """一次完整的签到: 签到 -> 查总积分 -> 达标才兑换。"""
+    result = CheckinResult()
 
-            # 2. 总积分
-            points_str, points_num = api.get_points(cookie)
-            result.points_total = points_str
+    with API(user_agent=config.user_agent) as api:
+        # 1. 签到
+        checkin_result = api.checkin(config.cookie)
+        result.status = checkin_result["status"]
+        result.code = checkin_result.get("code", CheckinStatus.FAILURE)
+        result.points = checkin_result.get("points", "0")
 
-            # 3. 兑换: 积分没到门槛就不发这个请求。服务端对积分不够只会回
-            #    "Not enough points", 每天发一次、再报一次错既没用又像是故障。
-            #    这里只写门槛, 不重复余额 —— 结果行里刚打过总积分。
-            required_points = self.config.EXCHANGE_PLAN_POINTS
-            if points_num < required_points:
-                result.exchange = f"未到 {required_points} 兑换门槛"
-            else:
-                result.exchange = api.exchange(cookie, self.config.EXCHANGE_PLAN)
+        # 2. 总积分
+        points_str, points_num = api.get_points(config.cookie)
+        result.points_total = points_str
 
-        return result
+        # 3. 兑换: 积分没到门槛就不发这个请求。服务端对积分不够只会回
+        #    "Not enough points", 每天发一次、再报一次错既没用又像是故障。
+        #    这里只写门槛, 不重复余额 —— 结果行里刚打过总积分。
+        if points_num < config.EXCHANGE_PLAN_POINTS:
+            result.exchange = f"未到 {config.EXCHANGE_PLAN_POINTS} 兑换门槛"
+        else:
+            result.exchange = api.exchange(config.cookie, config.EXCHANGE_PLAN)
 
-    def failed_cookie_indexes(self) -> List[int]:
-        """返回未签到成功 (也没重复签到) 的 Cookie 序号。
-
-        判据是「该账号有没有拿到成功或重复签到的结果」, 并且以配置里的账号数为准:
-        某个账号没有结果 (例如中途异常) 也算失败 —— 宁可报红, 也不能静默漏签。
-        """
-        succeeded = {
-            result.cookie_index
-            for result in self.results
-            if result.code in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
-        }
-        return [
-            idx
-            for idx in range(1, len(self.config.cookies_list) + 1)
-            if idx not in succeeded
-        ]
-
-    def format_results(self) -> str:
-        """汇总一行: 成功/失败/重复 各多少个账号。"""
-        success = sum(1 for r in self.results if r.code is CheckinStatus.SUCCESS)
-        repeat = sum(1 for r in self.results if r.code is CheckinStatus.REPEAT)
-        fail = sum(1 for r in self.results if r.code is CheckinStatus.FAILURE)
-        return f"成功 {success}, 失败 {fail}, 重复 {repeat}"
+    return result
 
 
 # 初始化日志
@@ -566,29 +509,28 @@ logger = init_logger()
 def main() -> int:
     """主函数, 返回进程退出码 (0 签到成功 / 1 签到失败 / 2 配置错误)。
 
-    日志约定: 每个账号跑完打一行结果 (在上面的 checkin_all 里), 这里只收尾 ——
-    失败时给出下一步, 最后无论成败都打一行带汇总与退出码的判定行。
+    日志约定: 跑完打一行结果, 这里只收尾 —— 失败时给出下一步, 最后一行带退出码。
     通知方式: 靠退出码让 GitHub Actions 变红, 由 GitHub 发失败邮件, 脚本不做推送。
     """
     exit_code = EXIT_OK
-    summary = ""
     next_step = ""
 
     try:
         config = Config()
 
-        if not config.cookies_list:
+        if not config.cookie:
             logger.error(f"未找到有效的 Cookie, 请设置 {Config.ENV_COOKIES}")
             exit_code = EXIT_CONFIG_ERROR
         else:
-            checker = Checker(config)
-            checker.checkin_all()
-            summary = checker.format_results()
+            result = run_checkin(config)
+            line = result.describe()
+            if result.passed:
+                logger.info(line)
+            else:
+                logger.warning(line)
 
-            failed_indexes = checker.failed_cookie_indexes()
-            if failed_indexes:
+            if not result.passed:
                 exit_code = EXIT_CHECKIN_FAILED
-                summary = f"{summary}, 失败账号 {', '.join(f'[{idx}]' for idx in failed_indexes)}"
                 next_step = (
                     f"请检查 Cookie 是否完整/过期 ({DOMAIN} 需要 {' 与 '.join(COOKIE_KEYS)} 两个字段), "
                     f"或签到被判定为自动签到 (code 4, 需设置 {Config.ENV_USER_AGENT})"
@@ -598,11 +540,10 @@ def main() -> int:
         logger.error(f"执行过程中发生未预期的错误: {e}")
         exit_code = EXIT_CHECKIN_FAILED
 
-    detail = f": {summary}" if summary else ""
     if exit_code == EXIT_OK:
-        logger.info(f"签到完成{detail} (退出码 {exit_code})")
+        logger.info(f"签到完成 (退出码 {exit_code})")
     else:
-        logger.error(f"签到失败{detail} (退出码 {exit_code})")
+        logger.error(f"签到失败 (退出码 {exit_code})")
     if next_step:
         logger.error(next_step)
 
