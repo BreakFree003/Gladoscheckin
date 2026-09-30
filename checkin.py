@@ -41,7 +41,10 @@ class LogEmoji:
 DOMAIN = "glados.cloud"
 COOKIE_KEYS: Tuple[str, ...] = ("gld:sess", "gld:sess.sig")
 
-"""认证失败时服务端返回的关键字 (中英文站点各一份)"""
+"""认证失败时服务端可能返回的关键字。
+
+中文是 glados.cloud 实测文案; 英文没有已知来源 (上游两站点时代留下的兜底), 留着
+只是防止服务端换文案时把权限错误误判成别的错误。"""
 PERMISSION_ERROR_HINTS: Tuple[str, ...] = ("没有权限", "no permission")
 
 """GLaDOS 判定「自动签到」时返回的 code 与关键字。
@@ -263,12 +266,11 @@ class API:
         self.session.headers.update(self.headers)
 
     def close(self) -> None:
-        """关闭 session"""
-        if hasattr(self, "session"):
-            try:
-                self.session.close()
-            except Exception as e:
-                logger.error(f"{LogEmoji.ERROR} 关闭 session 时发生错误: {e}")
+        """关闭 session。只有 with 语句会调用它, 那时 __init__ 必然已经跑完。"""
+        try:
+            self.session.close()
+        except Exception as e:
+            logger.error(f"{LogEmoji.ERROR} 关闭 session 时发生错误: {e}")
 
     def __enter__(self):
         """进入上下文管理器"""
@@ -611,7 +613,9 @@ class Checker:
             # 4. 执行兑换: 积分没到门槛就不发这个请求。
             #    服务端对积分不够只会回 "Not enough points", 每天发一次、再报一次错
             #    既没用又像是故障。门槛用的就是服务端自己回过的那个数字。
-            required_points = self.config.EXCHANGE_PLANS.get(self.config.exchange_plan, 500)
+            #    exchange_plan 只可能是 EXCHANGE_PLANS 的键 (Config 保证), 所以直接取,
+            #    不写默认值 —— 否则 500 这个门槛在仓库里就有两份字面量了。
+            required_points = self.config.EXCHANGE_PLANS[self.config.exchange_plan]
             if points_num < required_points:
                 result.exchange = f"未兑换 (积分 {points_num}/{required_points})"
                 self._log(

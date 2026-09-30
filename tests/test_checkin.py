@@ -25,8 +25,10 @@ COOKIE_SENTINEL = "SENTINEL_VALUE_MUST_NOT_BE_LOGGED"
 GLADOS_COOKIE = f"gld:sess={COOKIE_SENTINEL}_gsess; gld:sess.sig={COOKIE_SENTINEL}_gsig"
 # 只有会话字段的一半 (缺 .sig), 也是从浏览器复制时最常见的截断形态
 INCOMPLETE_SESSION_COOKIE = f"gld:sess={COOKIE_SENTINEL}_gsess; theme=dark"
-# 站点历史上前端用的是另一套字段名, 拿错那套时同样是坏的
-OTHER_SITE_COOKIE = f"koa:sess={COOKIE_SENTINEL}_sess; koa:sess.sig={COOKIE_SENTINEL}_sig"
+# 站点同源下发的旧字段名: 真实浏览器 Cookie 里 gld:* 与 koa:* 是并存的
+# (见 fixtures/browser_checkin_request.json 的 cookie 头), 但脚本只认 gld:*,
+# 所以只有旧字段的 Cookie 必须告警
+LEGACY_FIELDS_ONLY_COOKIE = f"koa:sess={COOKIE_SENTINEL}_sess; koa:sess.sig={COOKIE_SENTINEL}_sig"
 # 完全不像这个站点 Cookie 的输入
 NON_COOKIE_INPUT = f"not-a-cookie={COOKIE_SENTINEL}"
 # 两个账号, 用 & 分隔
@@ -326,16 +328,17 @@ def test_config_accepts_cookie_with_extra_unrelated_fields_without_warning(monke
     _assert_no_config_warning(caplog, cookie)
 
 
-def test_config_warns_for_cookie_from_the_other_site(monkeypatch, caplog):
-    """失败模式: 站点把会话拆成了两套字段, 拿成另一套 (koa:*) 时必须告警。
+def test_config_warns_for_cookie_with_only_legacy_fields(monkeypatch, caplog):
+    """失败模式: 只有本站旧字段 (koa:*) 而没有 gld:* 时必须告警。
 
-    这个脚本只服务 glados.cloud, 所以 koa:* 这类外站字段等价于「缺 gld:*」——
-    照旧静默通过的话, 用户只会在签到失败时才发现 Cookie 拿错了。
+    真实浏览器 Cookie 里两套字段是并存的, 所以「有 koa:*」本身不代表拿错了;
+    判据只有一个 —— 有没有 gld:sess 与 gld:sess.sig。照旧静默通过的话,
+    用户只会在签到失败时才发现自己挑错了字段。
     """
     with caplog.at_level("INFO"):
-        config = _config_with_cookie(monkeypatch, OTHER_SITE_COOKIE)
+        config = _config_with_cookie(monkeypatch, LEGACY_FIELDS_ONLY_COOKIE)
 
-    assert config.cookies_list == [OTHER_SITE_COOKIE]
+    assert config.cookies_list == [LEGACY_FIELDS_ONLY_COOKIE]
     assert "缺少会话字段" in caplog.text
     assert "gld:sess" in caplog.text
     assert COOKIE_SENTINEL not in caplog.text
@@ -435,11 +438,13 @@ def test_failed_cookie_indexes_treats_a_missing_result_as_failure():
 def _stub_api(monkeypatch):
     """把 API 层替换成可控结果, 只验证 main() 的退出码与日志。
 
-    state 可改: checkin_code (签到结果)、points (积分余额)、exchange_result (兑换返回)。
+    state 可改: checkin_code (签到结果)、checkin_points (本次签到拿到的积分)、
+    points (总积分余额)、exchange_result (兑换返回)。
     exchange_calls 记录真正发出去的兑换请求, 用来验证"积分不够就别发请求"。
     """
     state = {
         "checkin_code": checkin.CheckinStatus.SUCCESS,
+        "checkin_points": "0",
         "points": 500,
         "exchange_result": "兑换成功: plan500",
         "exchange_calls": [],
@@ -458,7 +463,7 @@ def _stub_api(monkeypatch):
         code = state["checkin_code"]
         return {
             "status": "签到成功" if code is checkin.CheckinStatus.SUCCESS else "签到失败",
-            "points": "0",
+            "points": state["checkin_points"],
             "message": "stub",
             "code": code,
         }
@@ -492,6 +497,25 @@ def test_main_returns_2_when_cookie_env_is_missing(monkeypatch, _stub_api):
     monkeypatch.delenv(checkin.Config.ENV_COOKIES, raising=False)
 
     assert checkin.main() == checkin.EXIT_CONFIG_ERROR
+
+
+def test_verbose_summary_reports_the_points_earned_by_this_checkin(monkeypatch, _stub_api, caplog):
+    """需求: verbose 明细里的「获得 N 积分」必须是本次签到真正拿到的积分。
+
+    回归的是 CheckinResult.points 从未被赋值 (于是 P: 恒为 0、这句话恒为"获得 0 积分")
+    这个 bug —— 它曾经在没有任何测试会因此变红的情况下存在了很久。
+    这也是 verbose 分支唯一的覆盖: 之前没有任何测试把 GLADOS_VERBOSE 打开过。
+    """
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
+    monkeypatch.setenv(checkin.Config.ENV_VERBOSE, "true")
+    _stub_api["checkin_points"] = "13"
+
+    with caplog.at_level("INFO"):
+        exit_code = checkin.main()
+
+    assert exit_code == checkin.EXIT_OK
+    assert "获得 13 积分" in caplog.text
+    assert "P:13" in caplog.text
 
 
 # --------------------------------------------------------------------------
@@ -685,7 +709,9 @@ def test_e2e_invalid_cookie_against_live_api_exits_nonzero_with_actionable_log()
     assert "没有权限" in proc.stderr
     # 失败提示要指名这个站点需要的会话字段
     assert "gld:sess" in combined
-    assert "签到失败" in proc.stderr
+    # 这里必须瞄准 main() 的账号级汇总那一句: 只写"签到失败"会被结果行
+    # "🍪[1] ⚠️  结果: 签到失败" 满足, 于是删掉整段汇总也照样绿。
+    assert "Cookie [1] 签到失败, 请检查 Cookie 是否完整/过期" in proc.stderr
     assert COOKIE_SENTINEL not in combined
 
 
