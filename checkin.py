@@ -474,7 +474,7 @@ class CheckinResult:
 
         # 重复签到时没有"获得"可言, 硬写一句"获得 0 积分"看着像 bug。
         earned = f"获得 {self.points} 积分, " if self.code is CheckinStatus.SUCCESS else ""
-        return f"{line}, {earned}{self.exchange}"
+        return f"{line}, {earned}总 {self.points_total}, {self.exchange}"
 
 
 def run_checkin(config: Config) -> CheckinResult:
