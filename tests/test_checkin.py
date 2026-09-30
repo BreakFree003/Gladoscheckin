@@ -275,7 +275,7 @@ def test_api_exchange_posts_compact_json_plan_type_like_the_web_console(monkeypa
 
     recorded = _capture_request(
         monkeypatch, {"code": 0, "message": "ok"},
-        lambda: api.exchange(BOTH_SITES_COOKIE, "plan500", 500),
+        lambda: api.exchange(BOTH_SITES_COOKIE, "plan500"),
     )
 
     assert recorded["path"] == "/api/user/exchange"
@@ -430,12 +430,26 @@ def test_failed_cookie_indexes_reports_cookie_failing_on_every_domain():
 
 @pytest.fixture()
 def _stub_api(monkeypatch):
-    """把 API 层替换成可控结果, 只验证 main() 的退出码与日志。"""
-    state = {"checkin_code": checkin.CheckinStatus.SUCCESS}
+    """把 API 层替换成可控结果, 只验证 main() 的退出码与日志。
+
+    state 可改: checkin_code (签到结果)、points (积分余额)、exchange_result (兑换返回)。
+    exchange_calls 记录真正发出去的兑换请求, 用来验证"积分不够就别发请求"。
+    """
+    state = {
+        "checkin_code": checkin.CheckinStatus.SUCCESS,
+        "points": 500,
+        "exchange_result": "兑换成功: plan500",
+        "exchange_calls": [],
+    }
 
     monkeypatch.setattr(checkin.API, "get_status", lambda self, cookies: ("42 天", 0))
-    monkeypatch.setattr(checkin.API, "get_points", lambda self, cookies: ("500 积分", 500))
-    monkeypatch.setattr(checkin.API, "exchange", lambda self, c, plan, pts: "未兑换")
+    monkeypatch.setattr(
+        checkin.API, "get_points", lambda self, cookies: (f"{state['points']} 积分", state["points"])
+    )
+
+    def fake_exchange(self, cookies, plan):
+        state["exchange_calls"].append(plan)
+        return state["exchange_result"]
 
     def fake_checkin(self, cookies):
         code = state["checkin_code"]
@@ -446,6 +460,7 @@ def _stub_api(monkeypatch):
             "code": code,
         }
 
+    monkeypatch.setattr(checkin.API, "exchange", fake_exchange)
     monkeypatch.setattr(checkin.API, "checkin", fake_checkin)
     return state
 
@@ -474,6 +489,77 @@ def test_main_returns_2_when_cookie_env_is_missing(monkeypatch, _stub_api):
     monkeypatch.delenv(checkin.Config.ENV_COOKIES, raising=False)
 
     assert checkin.main() == checkin.EXIT_CONFIG_ERROR
+
+
+# --------------------------------------------------------------------------
+# 兑换: 积分到门槛才发请求
+# --------------------------------------------------------------------------
+
+
+def test_no_exchange_request_when_points_are_below_the_plan_threshold(monkeypatch, _stub_api):
+    """需求: 积分不够就不要主动兑换。
+
+    线上表现: 余额 497 / plan500 需要 500 时, 服务端每次都回 "Not enough points",
+    于是每天多一次注定失败的请求 + 一条看着像故障的报错。积分是本脚本自己刚查过的,
+    够不够当场就能判断, 没必要去问服务端。
+    """
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, BOTH_SITES_COOKIE)
+    monkeypatch.delenv(checkin.Config.ENV_EXCHANGE_PLAN, raising=False)
+    _stub_api["points"] = 497
+
+    assert checkin.main() == checkin.EXIT_OK
+    assert _stub_api["exchange_calls"] == []
+
+
+def test_exchange_request_is_sent_once_points_reach_the_threshold(monkeypatch, _stub_api):
+    """边界: 刚好够就必须兑换 —— 门槛判断写成 > 而不是 >= 会永远差一分不兑换。"""
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, BOTH_SITES_COOKIE)
+    monkeypatch.delenv(checkin.Config.ENV_EXCHANGE_PLAN, raising=False)
+    _stub_api["points"] = 500
+
+    assert checkin.main() == checkin.EXIT_OK
+    assert set(_stub_api["exchange_calls"]) == {"plan500"}
+
+
+def test_exchange_success_is_logged_even_when_verbose_is_off(monkeypatch, caplog):
+    """需求: 兑换成功必须留痕。
+
+    它是一次扣掉几百积分、改变账号状态的操作, 而默认配置没开 verbose。
+    回归的就是"积分够了、兑换也成功了, 但日志里一个字都没有"这个观测盲区。
+    这里必须打真 API.exchange: 把 API 层 stub 掉就等于在测 stub 自己。
+    """
+    api = checkin.API("glados.cloud", 1)
+    monkeypatch.setattr(
+        checkin.API,
+        "_make_request",
+        lambda self, url, method, data=None, cookies="": _FakeResponse({"code": 0, "message": "ok"}),
+    )
+
+    with caplog.at_level("INFO"):
+        assert api.exchange(BOTH_SITES_COOKIE, "plan500") == "兑换成功: plan500"
+
+    assert any("兑换成功" in record.getMessage() for record in caplog.records), caplog.text
+
+
+def test_exchange_failure_does_not_fail_the_run(monkeypatch, _stub_api):
+    """需求: 兑换是附加动作, 失败不该让签到运行变红。
+
+    否则"积分不够"这类正常状态会天天把 Actions 染红, 把真正的签到失败淹没。
+    """
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, BOTH_SITES_COOKIE)
+    _stub_api["exchange_result"] = "兑换失败: 服务端炸了"
+
+    assert checkin.main() == checkin.EXIT_OK
+
+
+def test_exchange_requests_use_the_configured_plan(monkeypatch, _stub_api):
+    """需求: GLADOS_EXCHANGE_PLAN 要真的传下去, 不是永远发默认计划。"""
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, BOTH_SITES_COOKIE)
+    monkeypatch.setenv(checkin.Config.ENV_EXCHANGE_PLAN, "plan100")
+    _stub_api["points"] = 100
+
+    assert checkin.main() == checkin.EXIT_OK
+    assert set(_stub_api["exchange_calls"]) == {"plan100"}
 
 
 

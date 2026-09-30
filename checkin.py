@@ -568,8 +568,12 @@ class API:
             return "None 积分", 0
 
     @log_method
-    def exchange(self, cookies: str, plan: str, required_points: int) -> str:
-        """执行兑换"""
+    def exchange(self, cookies: str, plan: str) -> str:
+        """执行兑换。
+
+        调用方只在积分达到该计划门槛时才调用这里: 积分不够时服务端只会回
+        "Not enough points", 每天发一次请求、再报一次错没有意义。
+        """
         url = self._get_full_url(self.EXCHANGE_URL)
         response = self._make_request(url, "POST", {"planType": plan}, cookies)
 
@@ -578,16 +582,18 @@ class API:
             code = data.get("code", -2)
             message = data.get("message", "未知错误")
 
-            if code == 0:
-                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, message : {message} }}")
+            if code == CheckinStatus.SUCCESS.value:
+                # 兑换会真扣掉几百积分, 是"改变账号状态"的操作, 不管有没有开 verbose
+                # 都必须留痕 —— 否则成功时反而在日志里什么都看不到。
+                self._log("info", LogEmoji.SUCCESS, f"{plan} 兑换成功 (code {code}, message: {message})", force=True)
                 return f"兑换成功: {plan}"
             else:
-                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
+                self._log("info", LogEmoji.FAIL, f"{plan} 兑换失败 (code {code}, message: {message})", force=True)
                 if is_permission_error(code, message):
                     self._report_auth_error("exchange", message)
                 return f"兑换失败: {message}"
         else:
-            self._log("warning", LogEmoji.WARNING, "兑换失败", force=True)
+            self._log("warning", LogEmoji.WARNING, f"{plan} 兑换失败", force=True)
             return "兑换失败"
 
 
@@ -669,15 +675,26 @@ class Checker:
             points_str, points_num = api.get_points(cookie)
             result.points_total = points_str
 
-            # 4. 执行兑换
+            # 4. 执行兑换: 积分没到门槛就不发这个请求。
+            #    服务端对积分不够只会回 "Not enough points", 每天发一次、再报一次错
+            #    既没用又像是故障。门槛用的就是服务端自己回过的那个数字。
             required_points = self.config.EXCHANGE_PLANS.get(self.config.exchange_plan, 500)
-            self._log(
-                cookie_idx,
-                domain,
-                LogEmoji.EXCHANGE,
-                f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
-            )
-            result.exchange = api.exchange(cookie, self.config.exchange_plan, required_points)
+            if points_num < required_points:
+                result.exchange = f"未兑换 (积分 {points_num}/{required_points})"
+                self._log(
+                    cookie_idx,
+                    domain,
+                    LogEmoji.EXCHANGE,
+                    f"积分 {points_num}/{required_points}, 未达到 {self.config.exchange_plan} 门槛, 跳过兑换",
+                )
+            else:
+                self._log(
+                    cookie_idx,
+                    domain,
+                    LogEmoji.EXCHANGE,
+                    f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
+                )
+                result.exchange = api.exchange(cookie, self.config.exchange_plan)
 
         return result
 
