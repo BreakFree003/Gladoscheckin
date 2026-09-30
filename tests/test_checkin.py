@@ -68,7 +68,7 @@ def test_missing_cookie_keys_reports_the_incomplete_pair():
     "code,message,expected",
     [
         (-2, "没有权限", True),  # glados.cloud 实测响应
-        (-2, "No permission", True),  # 站点英文文案
+        (-2, "No permission", True),  # 英文文案没实测来源 (上游两站点时代的兜底)
         (-2, "NO PERMISSION", True),  # 大小写不敏感
         (1, "Today's observation logged. Return tomorrow for more points.", False),
         (1, "Not enough points. Need 500, have 320.0000000000000000", False),

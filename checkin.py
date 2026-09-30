@@ -37,8 +37,9 @@ COOKIE_KEYS: Tuple[str, ...] = ("gld:sess", "gld:sess.sig")
 
 """认证失败时服务端可能返回的关键字。
 
-中文是 glados.cloud 实测文案; 英文没有已知来源 (上游两站点时代留下的兜底), 留着
-只是防止服务端换文案时把权限错误误判成别的错误。"""
+中文是 glados.cloud 实测文案; 英文没有实测来源 (上游两站点时代留下的兜底)。
+保留它是为了不在"服务端换文案"这件事上做假设 —— 认不出来时权限错误会被归到
+"没见过响应"那一类, 虽然照样报红, 但可读性差一截。"""
 PERMISSION_ERROR_HINTS: Tuple[str, ...] = ("没有权限", "no permission")
 
 """GLaDOS 判定「自动签到」时返回的 code 与关键字。
@@ -473,7 +474,7 @@ class CheckinResult:
 
         # 重复签到时没有"获得"可言, 硬写一句"获得 0 积分"看着像 bug。
         earned = f"获得 {self.points} 积分, " if self.code is CheckinStatus.SUCCESS else ""
-        return f"{line}, {earned}总 {self.points_total}, {self.exchange}"
+        return f"{line}, {earned}{self.exchange}"
 
 
 def run_checkin(config: Config) -> CheckinResult:
