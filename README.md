@@ -143,7 +143,7 @@ GitHub 发失败邮件**。所以别关掉 Actions 的失败通知：
 | 日志现象 | 原因 | 处理 |
 |---|---|---|
 | `Cookie 缺少会话字段 gld:sess.sig` | 只抄了半对，或复制时被截断 | 回签到页重新复制完整 Cookie |
-| `认证失败 (code -2, message: 没有权限)` | Cookie 不完整或已过期（约 30 天） | 重新登录复制；这行会提示需要哪几个字段 |
+| `认证失败 (code -2, message: 没有权限)` | Cookie 不完整或已过期（约 30 天） | 重新登录复制完整 Cookie；紧跟着的那行会写清需要哪几个字段 |
 | `签到被判定为自动签到` / `code 4` | 请求的平台和登录浏览器不一致 | 按上文配置 `GLADOS_USER_AGENT`；日志里会打印服务端给的 `reason` / `loginDevice` / `currentDevice` |
 | 作业变红，末尾 `签到失败 (退出码 1)` | 这次签到没成功 | 紧跟着的那行会写下一步；再按上面依次检查 Cookie 和 `GLADOS_USER_AGENT` |
 

@@ -418,10 +418,15 @@ def _stub_api(monkeypatch):
 
     def fake_checkin(self, cookies):
         code = state["checkin_code"]
+        # 与真 API.checkin 保持一致: status 是 code 的函数, 三个 code 各不相同。
+        # (曾经这里把 REPEAT 也写成"签到失败", 结果行会打出"🔄 签到失败"这种矛盾文本。)
         return {
-            "status": "签到成功" if code is checkin.CheckinStatus.SUCCESS else "签到失败",
+            "status": {
+                checkin.CheckinStatus.SUCCESS: "签到成功",
+                checkin.CheckinStatus.REPEAT: "重复签到",
+                checkin.CheckinStatus.FAILURE: "签到失败",
+            }[code],
             "points": state["checkin_points"],
-            "message": "stub",
             "code": code,
         }
 
@@ -435,6 +440,32 @@ def test_main_returns_0_when_checkin_succeeds(monkeypatch, _stub_api):
     monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
 
     assert checkin.main() == checkin.EXIT_OK
+
+
+def test_repeat_checkin_is_a_pass(monkeypatch, _stub_api, caplog):
+    """需求: 「重复签到」必须算成功 (退出码 0)。
+
+    它每天真的在走: 站点回 code 1 表示今天这一次它已经记过了。手动触发（Actions 页面
+    点 Run workflow, 不跳过闸门）天天都会走到这一支。线上真实日志 (2026-09-30 手动触发)::
+
+        🔄 重复签到, 总 497 积分, 未到 500 兑换门槛
+        签到完成 (退出码 0)
+
+    谁把判据简化成"只认 code 0", 手动触发一次就会变红, 并给用户发一封假的失败邮件 ——
+    直接伤到「只有真失败才通知」这件事。而在此之前, 把 REPEAT 从白名单里拿掉
+    52 条测试全绿。
+    """
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
+    _stub_api["checkin_code"] = checkin.CheckinStatus.REPEAT
+    _stub_api["checkin_points"] = "0"
+    _stub_api["points"] = 497
+
+    with caplog.at_level("INFO"):
+        exit_code = checkin.main()
+
+    assert exit_code == checkin.EXIT_OK
+    assert "🔄 重复签到" in caplog.text
+    assert "签到完成 (退出码 0)" in caplog.text
 
 
 def test_main_returns_1_when_checkin_fails(monkeypatch, _stub_api, caplog):

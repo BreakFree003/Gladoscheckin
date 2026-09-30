@@ -104,18 +104,13 @@ def log_method(func):
             logger.error(f"API {method_name} 执行失败: {e}")
 
             DEFAULT_ERRORS = {
-                "checkin": {"status": "签到失败", "points": "0", "message": ""},
+                "checkin": {"status": "签到失败", "points": "0"},
                 "get_points": ("None 积分", 0),
                 "exchange": "",
             }
 
             if method_name in DEFAULT_ERRORS:
-                error_template = DEFAULT_ERRORS[method_name]
-                if isinstance(error_template, dict):
-                    error_result = error_template.copy()
-                    error_result["message"] = f"执行失败: {e}"
-                    return error_result
-                return error_template
+                return DEFAULT_ERRORS[method_name]
             raise
 
     return wrapper
@@ -245,15 +240,13 @@ class API:
         }
 
     def _log(self, level: str, message: str) -> None:
-        """统一的 API 层日志。
+        """统一的 API 层日志, 只有 warning / error 两种调用。
 
-        这里只输出有信息量的事件 (失败)。成功的请求不逐条回显 —— 跑完会有一行结果。
+        只输出有信息量的事件 (失败); 成功的请求不逐条回显 —— 跑完会有一行结果。
         """
-        if level == "info":
-            logger.info(message)
-        elif level == "warning":
+        if level == "warning":
             logger.warning(message)
-        elif level == "error":
+        else:
             logger.error(message)
 
     def _get_full_url(self, path: str) -> str:
@@ -351,7 +344,6 @@ class API:
         result = {
             "status": "签到失败",
             "points": "0",
-            "message": "",
             "code": CheckinStatus.FAILURE,
         }
 
@@ -365,12 +357,10 @@ class API:
                 result["code"] = CheckinStatus.SUCCESS
                 result["status"] = "签到成功"
                 result["points"] = points
-                result["message"] = message
             elif code == CheckinStatus.REPEAT.value:
                 result["code"] = CheckinStatus.REPEAT
                 result["status"] = "重复签到"
                 result["points"] = "0"
-                result["message"] = message
             else:
                 # 已知原因 (权限/反自动化) 各自有专门的一行解释, 只有其他 code
                 # 才需要在这里留下原始 code 与 message。
@@ -385,11 +375,9 @@ class API:
                 result["code"] = CheckinStatus.FAILURE
                 result["status"] = "签到失败"
                 result["points"] = "0"
-                result["message"] = message
         else:
             result["code"] = CheckinStatus.FAILURE
             result["status"] = "签到失败"
-            result["message"] = "网络请求失败"
 
         return result
 
