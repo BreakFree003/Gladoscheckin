@@ -456,20 +456,27 @@ def test_main_returns_2_when_cookie_env_is_missing(monkeypatch, _stub_api):
     assert checkin.main() == checkin.EXIT_CONFIG_ERROR
 
 
-def test_result_line_reports_the_points_earned_by_this_checkin(monkeypatch, _stub_api, caplog):
-    """需求: 结果行里的「获得 N 积分」必须是本次签到真正拿到的积分。
+def test_result_line_says_what_happened_and_where_the_account_stands(monkeypatch, _stub_api, caplog):
+    """需求: 结果行是每天唯一要看的那一行, 它得同时说清「这次签到发生了什么」和
+    「离兑换还差多少」—— 后者的具体数字由这一行负责, 别处都没有。
 
-    回归的是 CheckinResult.points 从未被赋值 (于是这里恒为"获得 0 积分") 那个 bug ——
-    它曾经在没有任何测试会因此变红的情况下存在了很久。
+    两个都回归过:
+    - 「获得 N 积分」曾是 CheckinResult.points 从未被赋值, 恒为"获得 0 积分";
+    - 「总 N 积分」曾在 52 条测试全绿的情况下被一次误提交从结果行里删掉
+      (2026-09-30, 见 a68d159 / 2638edc) —— 结果行少打余额, 连测试带 CI 都不会响。
     """
     monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
     _stub_api["checkin_points"] = "13"
+    _stub_api["points"] = 497
 
     with caplog.at_level("INFO"):
         exit_code = checkin.main()
 
     assert exit_code == checkin.EXIT_OK
     assert "获得 13 积分" in caplog.text
+    assert "总 497 积分" in caplog.text
+    # 门槛进度也用同一条结果行交代, 期望值按配置拼, 免得改了门槛这里还绿着。
+    assert f"未到 {checkin.Config.EXCHANGE_PLAN_POINTS} 兑换门槛" in caplog.text
 
 
 def test_a_successful_checkin_logs_neither_the_request_nor_the_cookie(monkeypatch, caplog):
