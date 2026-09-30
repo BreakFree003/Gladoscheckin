@@ -17,21 +17,18 @@ class CheckinStatus(Enum):
 
 
 class LogEmoji:
-    """日志 Emoji 常量"""
+    """日志里的状态标记。
+
+    只挂在"结果"上, 不给每一行都配一个 —— 行首的级别 (INFO/WARNING/ERROR) 已经
+    说明了性质, 再补一个 ℹ️ 只是噪音, 而且各行的 emoji 间距还不一致。
+    """
 
     SUCCESS = "✅"
-    FAIL = "❌"
     REPEAT = "🔄"
-    CHECKIN = "🎫"
-    STATUS = "📊"
-    POINTS = "💰"
-    EXCHANGE = "🎁"
-    START = "🚀"
-    END = "🏁"
-    COOKIE = "🍪"
-    WARNING = "⚠️ "
-    ERROR = "🔴"
-    INFO = "ℹ️ "
+    FAIL = "❌"
+    WARNING = "⚠️"
+    SEND = "→"
+    RECV = "←"
 
 
 """唯一的站点。
@@ -106,7 +103,7 @@ def log_method(func):
             result = func(self, *args, **kwargs)
             return result
         except Exception as e:
-            logger.error(f"{LogEmoji.COOKIE}[{self.cookie_index}] {LogEmoji.ERROR} {method_name} 执行失败: {e}")
+            logger.error(f"[{self.cookie_index}] API {method_name} 执行失败: {e}")
 
             DEFAULT_ERRORS = {
                 "checkin": {"status": "签到失败", "points": "0", "message": ""},
@@ -131,7 +128,6 @@ class Config:
     """应用配置"""
 
     ENV_COOKIES = "GLADOS_COOKIES"
-    ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
     ENV_USER_AGENT = "GLADOS_USER_AGENT"
 
@@ -144,60 +140,33 @@ GLaDOS 的反自动化校验会比对「签到请求的平台」与「登录时�
 你自己浏览器的 navigator.userAgent 才是最稳的做法。"""
     DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
 
-    """默认兑换计划"""
-    DEFAULT_EXCHANGE_PLAN = "plan500"
-
-    """默认是否输出详细响应"""
+    """默认是否输出详细日志"""
     DEFAULT_VERBOSE = False
 
-    """兑换计划 -> 需要的积分 (与站点一致: plan500 服务端自己回过 "Need 500")"""
-    EXCHANGE_PLANS = {
-        "plan100": 100,
-        "plan200": 200,
-        "plan500": 500,
-    }
+    """兑换计划与它需要的积分。
+
+只有 plan500 一个: 服务端自己回过 "Need 500", 是唯一验证过的门槛。
+plan100 / plan200 来自站点说明但从未在真实接口上验证过, 而 GLADOS_EXCHANGE_PLAN
+这个开关除了把门槛改小之外没有别的用处, 所以连同它一起去掉了。"""
+    EXCHANGE_PLAN = "plan500"
+    EXCHANGE_PLAN_POINTS = 500
 
     def __init__(self):
         self.cookies_list: List[str] = []
-        self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
         self.user_agent: str = self.DEFAULT_USER_AGENT
         self._load_config()
 
     def _load_config(self) -> None:
-        """加载配置"""
+        """加载配置, 并把生效的配置打成启动日志 (一行, 便于事后对照)。"""
         raw_cookies_env: Optional[str] = os.environ.get(self.ENV_COOKIES)
-        exchange_plan_env: Optional[str] = os.environ.get(self.ENV_EXCHANGE_PLAN)
         verbose_env: Optional[str] = os.environ.get(self.ENV_VERBOSE)
         user_agent_env: Optional[str] = os.environ.get(self.ENV_USER_AGENT)
 
-        if not raw_cookies_env:
-            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_COOKIES}' 未设置。")
-            self.cookies_list = []
-        else:
+        if raw_cookies_env:
             self.cookies_list = [cookie.strip() for cookie in raw_cookies_env.split("&") if cookie.strip()]
             if not self.cookies_list:
-                raise ValueError(f"环境变量 '{self.ENV_COOKIES}' 已设置，但未包含任何有效的 Cookie。")
-
-        # 不设这个环境变量是最常见的正常情况, 所以只能是 info 级别的提示:
-        # 让正常路径上出现 ⚠️ 会训练人忽略警告, 真正的异常反而看不见。
-        if not exchange_plan_env:
-            self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
-            logger.info(
-                f"{LogEmoji.INFO} 未设置 {self.ENV_EXCHANGE_PLAN}, 使用默认兑换计划 {self.exchange_plan}。"
-            )
-        elif exchange_plan_env in self.EXCHANGE_PLANS:
-            self.exchange_plan = exchange_plan_env
-            logger.info(f"{LogEmoji.SUCCESS} 使用指定的兑换计划: {self.exchange_plan}")
-        else:
-            self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
-            logger.warning(
-                f"{LogEmoji.WARNING} 环境变量 '{self.ENV_EXCHANGE_PLAN}' 的值 '{exchange_plan_env}' "
-                f"无效, 将使用默认兑换计划 {self.DEFAULT_EXCHANGE_PLAN}。"
-            )
-
-        logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.cookies_list)} 个 Cookie 用于签到。")
-        self._validate_cookies()
+                raise ValueError(f"环境变量 '{self.ENV_COOKIES}' 已设置, 但未包含任何有效的 Cookie。")
 
         if verbose_env is not None:
             verbose_env_lower = verbose_env.lower()
@@ -206,36 +175,43 @@ GLaDOS 的反自动化校验会比对「签到请求的平台」与「登录时�
             elif verbose_env_lower in ["false", "0", "no", "n"]:
                 self.verbose = False
             else:
-                logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_VERBOSE}' 的值 '{verbose_env}' 无效，将使用默认值 {self.DEFAULT_VERBOSE}。")
+                logger.warning(
+                    f"环境变量 '{self.ENV_VERBOSE}' 的值 '{verbose_env}' 无效, "
+                    f"按 {self.DEFAULT_VERBOSE} 处理。"
+                )
 
-        logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_VERBOSE}: {self.verbose}。")
+        logger.info(
+            f"开始签到: {len(self.cookies_list)} 个账号, "
+            f"兑换 {self.EXCHANGE_PLAN} (需 {self.EXCHANGE_PLAN_POINTS} 积分), "
+            f"详细日志 {'开' if self.verbose else '关'}"
+        )
 
         if user_agent_env and user_agent_env.strip():
             self.user_agent = user_agent_env.strip()
-            logger.info(f"{LogEmoji.INFO} 使用 {self.ENV_USER_AGENT} 指定的 User-Agent。")
+            logger.info(f"User-Agent: 用 {self.ENV_USER_AGENT} 指定的值")
         else:
-            logger.info(
-                f"{LogEmoji.INFO} 未设置 {self.ENV_USER_AGENT}, 使用默认 {self.user_agent}。"
-                "若签到被判定为自动签到 (code 4), 请把它设为你浏览器的 navigator.userAgent。"
-            )
+            logger.info(f"User-Agent: 内置默认 (可用 {self.ENV_USER_AGENT} 覆盖为登录浏览器的 UA)")
+
+        self._validate_cookies()
 
     def _validate_cookies(self) -> None:
-        """校验 Cookie 结构, 只输出字段名与数量, 不输出凭据本身。"""
+        """校验 Cookie 结构, 只输出字段名与数量, 不输出凭据本身。
+
+        字段齐全属于正常情况, 只写详细日志; 缺字段才是要看的那条。
+        """
         for idx, cookie in enumerate(self.cookies_list, 1):
             missing = missing_cookie_keys(cookie)
             if not missing:
-                logger.info(
-                    f"{LogEmoji.INFO} Cookie[{idx}] 会话字段完整 "
-                    f"({len(parse_cookie_keys(cookie))} 项)。"
-                )
+                if self.verbose:
+                    logger.info(f"[{idx}] Cookie 会话字段完整 ({len(parse_cookie_keys(cookie))} 项)")
                 continue
 
             present = parse_cookie_keys(cookie)
             logger.warning(
-                f"{LogEmoji.WARNING} Cookie[{idx}] 缺少会话字段 "
-                f"{'/'.join(missing)} (当前字段: {', '.join(present) if present else '无'})。"
-                f"{DOMAIN} 需要 {' 与 '.join(COOKIE_KEYS)} 两个字段 "
-                f"(缺 .sig 大多是复制时被截断了), 请重新复制完整 Cookie 更新 {self.ENV_COOKIES}。"
+                f"[{idx}] Cookie 缺少会话字段 {'/'.join(missing)} "
+                f"(当前字段: {', '.join(present) if present else '无'}); "
+                f"{DOMAIN} 需要 {' 与 '.join(COOKIE_KEYS)} 两个字段, "
+                f"缺 .sig 大多是复制时被截断了, 请重新复制完整 Cookie 更新 {self.ENV_COOKIES}"
             )
 
 
@@ -270,7 +246,7 @@ class API:
         try:
             self.session.close()
         except Exception as e:
-            logger.error(f"{LogEmoji.ERROR} 关闭 session 时发生错误: {e}")
+            logger.error(f"关闭 session 时发生错误: {e}")
 
     def __enter__(self):
         """进入上下文管理器"""
@@ -302,18 +278,21 @@ class API:
             "user-agent": self.user_agent,
         }
 
-    def _log(self, level: str, emoji: str, message: str, force: bool = False) -> None:
-        """统一日志输出方法"""
+    def _log(self, level: str, message: str, force: bool = False) -> None:
+        """统一日志输出方法。
 
-        log_message = f"{LogEmoji.COOKIE}[{self.cookie_index}] {emoji} {message}"
+        行首的 `[N]` 是账号序号 (多个账号时才分得清), 详细日志以外的行平时不出现。
+        """
+        if not (force or self.verbose):
+            return
 
-        if force or self.verbose:
-            if level == "info":
-                logger.info(log_message)
-            elif level == "warning":
-                logger.warning(log_message)
-            elif level == "error":
-                logger.error(log_message)
+        log_message = f"[{self.cookie_index}] {message}"
+        if level == "info":
+            logger.info(log_message)
+        elif level == "warning":
+            logger.warning(log_message)
+        elif level == "error":
+            logger.error(log_message)
 
     def _get_full_url(self, path: str) -> str:
         """获取完整 URL"""
@@ -326,10 +305,7 @@ class API:
         self._auth_error_reported = True
         self._log(
             "error",
-            LogEmoji.ERROR,
-            f"{endpoint} 认证失败 (code -2, message: {message})：Cookie 无效、已过期或不完整。"
-            f"{DOMAIN} 需要 {' 与 '.join(COOKIE_KEYS)} 两个字段 (缺 .sig 大多是复制时被截断了)。"
-            "请重新登录, 复制完整的 Cookie 更新 GLADOS_COOKIES。",
+            f"{endpoint} 认证失败 (code -2, message: {message}): Cookie 无效、已过期或不完整",
             force=True,
         )
 
@@ -343,22 +319,20 @@ class API:
             return
         self._automation_error_reported = True
 
-        message = payload.get("message", "")
         details = [
             f"{key}: {payload[key]}"
             for key in ("reason", "loginDevice", "currentDevice")
             if payload.get(key)
         ]
-        detail_text = f"(服务端返回 {'; '.join(details)}) " if details else ""
+        detail_text = f" 服务端返回 {'; '.join(details)}。" if details else " "
 
         self._log(
             "error",
-            LogEmoji.ERROR,
-            f"签到被判定为自动签到 (message: {message})。"
-            f"{detail_text}GLaDOS 会比对「登录时的设备平台」与「这次请求声明的平台」，"
-            f"脚本里能声明平台的只有 User-Agent，当前为 [{self.user_agent}]。"
-            "请在**当时登录的那个浏览器**的控制台执行 navigator.userAgent，"
-            "把完整值设为 GLADOS_USER_AGENT (Windows / Linux / iPhone 的 UA 实测都会被拦下)。",
+            f"签到被判定为自动签到 (message: {payload.get('message', '')})。{detail_text}"
+            f"GLaDOS 比对的是「登录时的设备平台」与「这次请求声明的平台」, 而脚本能声明平台的"
+            f"只有 User-Agent (当前 [{self.user_agent}])。请在登录那个浏览器的控制台执行 "
+            f"navigator.userAgent, 把完整值设为 {Config.ENV_USER_AGENT} "
+            "(Windows / Linux / iPhone 的 UA 实测都会被拦下)",
             force=True,
         )
 
@@ -375,31 +349,36 @@ class API:
 
         请求体与 POST 的 content-type 与网页端逐字一致: 站点前端走 axios,
         请求体是紧凑 JSON, content-type 为 `application/json;charset=UTF-8`。
-        GET 请求则**不带** content-type —— 浏览器的 GET 也不带。"""
+        GET 请求则**不带** content-type —— 浏览器的 GET 也不带。
+
+        线上流量只在这里记一次 (详细日志): 请求记方法/路径/请求体, 响应记状态码与
+        响应体。各接口方法因此不用再各自回显一遍原始 JSON。Cookie 不在记录范围内
+        —— 请求头从不进日志。
+        """
+        path = url.removeprefix(f"https://{DOMAIN}")
+        body = self._serialize_post_body(data).decode("utf-8") if data else ""
         session_headers = self.headers.copy()
         session_headers["cookie"] = cookies
 
         try:
             if method.upper() == "POST":
                 session_headers["content-type"] = self.CONTENT_TYPE_JSON
-                response = self.session.post(
-                    url,
-                    headers=session_headers,
-                    data=self._serialize_post_body(data),
-                    timeout=(60, 120),
-                )
+                self._log("info", f"{LogEmoji.SEND} POST {path} {body}")
+                response = self.session.post(url, headers=session_headers, data=body.encode("utf-8"), timeout=(60, 120))
             elif method.upper() == "GET":
+                self._log("info", f"{LogEmoji.SEND} GET {path}")
                 response = self.session.get(url, headers=session_headers, timeout=(60, 120))
             else:
-                self._log("error", LogEmoji.ERROR, f"不支持的 HTTP 方法: {method}", force=True)
+                self._log("error", f"不支持的 HTTP 方法: {method}", force=True)
                 return None
 
+            self._log("info", f"{LogEmoji.RECV} {response.status_code} {response.text}")
             if not response.ok:
-                self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，状态码 {response.status_code}。响应内容: {response.text}", force=True)
+                self._log("warning", f"请求 {path} 失败: HTTP {response.status_code}, 响应内容: {response.text}", force=True)
                 return None
             return response
         except requests.exceptions.RequestException as e:
-            self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {e}", force=True)
+            self._log("error", f"请求 {path} 时发生网络错误: {e}", force=True)
             return None
 
     def _get_checkin_data(self) -> Dict[str, str]:
@@ -427,29 +406,29 @@ class API:
             points = str(data.get("points", 0))
 
             if code == CheckinStatus.SUCCESS.value:
-                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}")
                 result["code"] = CheckinStatus.SUCCESS
                 result["status"] = "签到成功"
                 result["points"] = points
                 result["message"] = message
             elif code == CheckinStatus.REPEAT.value:
-                self._log("info", LogEmoji.REPEAT, f"{{ code : {code}, message : {message} }}", force=True)
                 result["code"] = CheckinStatus.REPEAT
                 result["status"] = "重复签到"
                 result["points"] = "0"
                 result["message"] = message
             else:
-                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
+                # 已知原因 (权限/反自动化) 各自有专门的一行解释, 只有其他 code
+                # 才需要在这里留下原始 code 与 message。
                 if is_permission_error(code, message):
                     self._report_auth_error("checkin", message)
                 elif is_automation_blocked(code, message):
                     self._report_automation_block(data)
+                else:
+                    self._log("error", f"签到失败: code {code}, message: {message}", force=True)
                 result["code"] = CheckinStatus.FAILURE
                 result["status"] = "签到失败"
                 result["points"] = "0"
                 result["message"] = message
         else:
-            self._log("warning", LogEmoji.WARNING, "签到失败", force=True)
             result["code"] = CheckinStatus.FAILURE
             result["status"] = "签到失败"
             result["message"] = "网络请求失败"
@@ -458,8 +437,7 @@ class API:
 
     @log_method
     def get_status(self, cookies: str) -> Tuple[str, int]:
-        """获取状态"""
-
+        """获取剩余天数。第二个返回值只是给详细日志用的原始 code。"""
         url = self._get_full_url(self.STATUS_URL)
         response = self._make_request(url, "GET", cookies=cookies)
 
@@ -470,21 +448,20 @@ class API:
             left_days = data.get("data", {}).get("leftDays", None)
 
             if left_days is not None:
-                left_days_int = int(float(left_days))
-                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, leftDays : {left_days_int} 天}}")
-                return f"{left_days_int} 天", code
+                return f"{int(float(left_days))} 天", code
+
+            # 权限问题的解释统一交给 _report_auth_error 打一次, 这里不再重说一遍。
+            if is_permission_error(code, message):
+                self._report_auth_error("status", message)
             else:
-                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, leftDays : {left_days} 天}}", force=True)
-                if is_permission_error(code, message):
-                    self._report_auth_error("status", message)
-                return "None 天", code
-        else:
-            self._log("warning", LogEmoji.WARNING, "获取状态失败", force=True)
-            return "None 天", -2
+                self._log("warning", f"读取剩余天数失败: code {code}, message: {message}", force=True)
+            return "None 天", code
+
+        return "None 天", -2
 
     @log_method
     def get_points(self, cookies: str) -> Tuple[str, int]:
-        """获取积分"""
+        """获取总积分。第二个返回值是给兑换门槛用的数字。"""
         url = self._get_full_url(self.POINTS_URL)
         response = self._make_request(url, "GET", cookies=cookies)
 
@@ -496,24 +473,21 @@ class API:
 
             if points is not None:
                 points_int = int(float(points))
-                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points_int} 积分}}")
-                points_str = f"{points_int} 积分"
-                points_num = points_int
-                return points_str, points_num
+                return f"{points_int} 积分", points_int
+
+            if is_permission_error(code, message):
+                self._report_auth_error("points", message)
             else:
-                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, points : {points} 积分}}", force=True)
-                if is_permission_error(code, message):
-                    self._report_auth_error("points", message)
-                return "None 积分", 0
-        else:
-            self._log("warning", LogEmoji.WARNING, "获取积分失败", force=True)
+                self._log("warning", f"读取总积分失败: code {code}, message: {message}", force=True)
             return "None 积分", 0
+
+        return "None 积分", 0
 
     @log_method
     def exchange(self, cookies: str, plan: str) -> str:
         """执行兑换。
 
-        调用方只在积分达到该计划门槛时才调用这里: 积分不够时服务端只会回
+        调用方只在积分达到门槛时才调用这里: 积分不够时服务端只会回
         "Not enough points", 每天发一次请求、再报一次错没有意义。
         """
         url = self._get_full_url(self.EXCHANGE_URL)
@@ -525,18 +499,17 @@ class API:
             message = data.get("message", "未知错误")
 
             if code == CheckinStatus.SUCCESS.value:
-                # 兑换会真扣掉几百积分, 是"改变账号状态"的操作, 不管有没有开 verbose
+                # 兑换会真扣掉几百积分, 是"改变账号状态"的操作, 不管有没有开详细日志
                 # 都必须留痕 —— 否则成功时反而在日志里什么都看不到。
-                self._log("info", LogEmoji.SUCCESS, f"{plan} 兑换成功 (code {code}, message: {message})", force=True)
+                self._log("info", f"兑换成功: {plan} (code {code}, message: {message})", force=True)
                 return f"兑换成功: {plan}"
-            else:
-                self._log("info", LogEmoji.FAIL, f"{plan} 兑换失败 (code {code}, message: {message})", force=True)
-                if is_permission_error(code, message):
-                    self._report_auth_error("exchange", message)
-                return f"兑换失败: {message}"
-        else:
-            self._log("warning", LogEmoji.WARNING, f"{plan} 兑换失败", force=True)
-            return "兑换失败"
+
+            self._log("error", f"兑换失败: {plan} (code {code}, message: {message})", force=True)
+            if is_permission_error(code, message):
+                self._report_auth_error("exchange", message)
+            return f"兑换失败: {message}"
+
+        return "兑换失败"
 
 
 @dataclass()
@@ -562,74 +535,75 @@ class Checker:
         self.config = config
         self.results: List[CheckinResult] = []
 
-    def _log(self, cookie_idx: int, emoji: str, message: str, force: bool = False) -> None:
-        """统一日志输出方法"""
+    def _log(self, cookie_idx: int, message: str, level: str = "info", verbose_only: bool = False) -> None:
+        """统一的账号级日志。
 
-        if self.config.verbose or force:
-            logger.info(f"{LogEmoji.COOKIE}[{cookie_idx}] {emoji} {message}")
+        结果行一定要输出 (不能被详细日志开关藏起来), 过程性细节走 verbose_only。
+        """
+        if verbose_only and not self.config.verbose:
+            return
+
+        log_message = f"[{cookie_idx}] {message}"
+        if level == "warning":
+            logger.warning(log_message)
+        else:
+            logger.info(log_message)
 
     def checkin_all(self) -> None:
-        """依次签到每个账号"""
-        total = len(self.config.cookies_list)
-        logger.info(f"{LogEmoji.INFO} 共 {total} 个 Cookie 待签到")
-
+        """依次签到每个账号, 每个账号跑完就打一行结果。"""
         for cookie_idx, cookie in enumerate(self.config.cookies_list, 1):
-            logger.info(f"{LogEmoji.START} ========== Cookie {cookie_idx}/{total} ==========")
             result = self._checkin_account(cookie, cookie_idx)
             self.results.append(result)
+            self._log(
+                cookie_idx,
+                self._describe(result),
+                level="warning" if result.code is CheckinStatus.FAILURE else "info",
+            )
 
-            result_message = f"结果: {result.status}"
-            if result.code == CheckinStatus.SUCCESS:
-                if self.config.verbose:
-                    result_message = (
-                        f"结果: {result.status}, 获得 {result.points} 积分, 剩余 {result.days}, "
-                        f"总 {result.points_total}, {result.exchange}"
-                    )
-                self._log(cookie_idx, LogEmoji.SUCCESS, result_message, force=True)
-            else:
-                self._log(cookie_idx, LogEmoji.WARNING, result_message, force=True)
+    @staticmethod
+    def _describe(result: CheckinResult) -> str:
+        """把单个账号的结果拼成一行: 状态 + 本次获得/剩余/总积分 + 兑换情况。"""
+        emoji = {
+            CheckinStatus.SUCCESS: LogEmoji.SUCCESS,
+            CheckinStatus.REPEAT: LogEmoji.REPEAT,
+            CheckinStatus.FAILURE: LogEmoji.FAIL,
+        }[result.code]
+
+        line = f"{emoji} {result.status}"
+        if result.code is CheckinStatus.FAILURE:
+            return line
+        return f"{line}, 获得 {result.points} 积分, 剩余 {result.days}, 总 {result.points_total}, {result.exchange}"
 
     def _checkin_account(self, cookie: str, cookie_idx: int) -> CheckinResult:
-        """一个账号的完整流程: 查状态 -> 签到 -> 查积分 -> 兑换。"""
+        """一个账号的完整流程: 查状态 -> 签到 -> 查积分 -> 达标才兑换。"""
         result = CheckinResult(cookie_idx)
 
         with API(cookie_idx, verbose=self.config.verbose, user_agent=self.config.user_agent) as api:
-            # 1. 获取状态
-            self._log(cookie_idx, LogEmoji.STATUS, "查询剩余天数")
+            # 1. 剩余天数 (只进详细日志的结果行, 默认日志里靠签到结果说话)
             result.days, _ = api.get_status(cookie)
 
             # 2. 签到
-            self._log(cookie_idx, LogEmoji.CHECKIN, "执行签到")
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
             result.points = checkin_result.get("points", "0")
 
-            # 3. 获取积分
-            self._log(cookie_idx, LogEmoji.POINTS, "查询总积分")
+            # 3. 总积分
             points_str, points_num = api.get_points(cookie)
             result.points_total = points_str
 
-            # 4. 执行兑换: 积分没到门槛就不发这个请求。
-            #    服务端对积分不够只会回 "Not enough points", 每天发一次、再报一次错
-            #    既没用又像是故障。门槛用的就是服务端自己回过的那个数字。
-            #    exchange_plan 只可能是 EXCHANGE_PLANS 的键 (Config 保证), 所以直接取,
-            #    不写默认值 —— 否则 500 这个门槛在仓库里就有两份字面量了。
-            required_points = self.config.EXCHANGE_PLANS[self.config.exchange_plan]
+            # 4. 兑换: 积分没到门槛就不发这个请求。服务端对积分不够只会回
+            #    "Not enough points", 每天发一次、再报一次错既没用又像是故障。
+            required_points = self.config.EXCHANGE_PLAN_POINTS
             if points_num < required_points:
                 result.exchange = f"未兑换 (积分 {points_num}/{required_points})"
                 self._log(
                     cookie_idx,
-                    LogEmoji.EXCHANGE,
-                    f"积分 {points_num}/{required_points}, 未达到 {self.config.exchange_plan} 门槛, 跳过兑换",
+                    f"积分 {points_num}/{required_points}, 未到 {self.config.EXCHANGE_PLAN} 门槛, 跳过兑换",
+                    verbose_only=True,
                 )
             else:
-                self._log(
-                    cookie_idx,
-                    LogEmoji.EXCHANGE,
-                    f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
-                )
-                result.exchange = api.exchange(cookie, self.config.exchange_plan)
+                result.exchange = api.exchange(cookie, self.config.EXCHANGE_PLAN)
 
         return result
 
@@ -654,28 +628,13 @@ class Checker:
             if idx not in succeeded
         ]
 
-    def format_results(self) -> Tuple[str, str]:
-        """格式化结果, 返回 (总结标题, 逐条明细)。"""
+    def format_results(self) -> str:
+        """汇总一行: 成功/失败/重复 各多少个账号。"""
         results = self.get_results()
-
-        success_count = sum(1 for r in results if r["code"] == CheckinStatus.SUCCESS)
-        repeat_count = sum(1 for r in results if r["code"] == CheckinStatus.REPEAT)
-        fail_count = sum(1 for r in results if r["code"] == CheckinStatus.FAILURE)
-
-        title = f"GLaDOS 签到, 成功{success_count}, 失败{fail_count}, 重复{repeat_count}"
-
-        log_content_lines = []
-        for res in results:
-            if self.config.verbose:
-                log_line = (
-                    f"Cookie[{res['cookie_index']}] P:{res['points']} 剩余:{res['days']} "
-                    f"总积分:{res['points_total']} | {res['status']} | {res['exchange']}"
-                )
-            else:
-                log_line = f"Cookie[{res['cookie_index']}] {res['status']}"
-            log_content_lines.append(log_line)
-
-        return title, "\n".join(log_content_lines)
+        success = sum(1 for r in results if r["code"] == CheckinStatus.SUCCESS)
+        repeat = sum(1 for r in results if r["code"] == CheckinStatus.REPEAT)
+        fail = sum(1 for r in results if r["code"] == CheckinStatus.FAILURE)
+        return f"成功 {success}, 失败 {fail}, 重复 {repeat}"
 
 
 # 初始化日志
@@ -683,49 +642,48 @@ logger = init_logger()
 
 
 def main() -> int:
-    """主函数, 返回进程退出码 (0 成功 / 1 签到失败 / 2 配置错误)。
+    """主函数, 返回进程退出码 (0 签到成功 / 1 签到失败 / 2 配置错误)。
 
-    通知方式: 靠退出码让 GitHub Actions 变红, 由 GitHub 发失败邮件。
-    脚本自己不做任何推送。
+    日志约定: 每个账号跑完打一行结果 (在上面的 checkin_all 里), 这里只收尾 ——
+    失败时给出下一步, 最后无论成败都打一行带汇总与退出码的判定行。
+    通知方式: 靠退出码让 GitHub Actions 变红, 由 GitHub 发失败邮件, 脚本不做推送。
     """
     exit_code = EXIT_OK
+    summary = ""
+    next_step = ""
 
     try:
-        # 1. 加载配置
-        logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
         config = Config()
 
         if not config.cookies_list:
-            logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie, 退出程序。")
+            logger.error(f"未找到有效的 Cookie, 请设置 {Config.ENV_COOKIES}")
             exit_code = EXIT_CONFIG_ERROR
         else:
-            # 2. 执行签到
-            logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
             checker = Checker(config)
             checker.checkin_all()
-
-            # 3. 汇总结果
-            logger.info(f"{LogEmoji.START} 步骤 3: 汇总结果")
-            title, log_content = checker.format_results()
-            logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
+            summary = checker.format_results()
 
             failed_indexes = checker.failed_cookie_indexes()
             if failed_indexes:
                 exit_code = EXIT_CHECKIN_FAILED
-                logger.error(
-                    f"{LogEmoji.ERROR} Cookie "
-                    f"{', '.join(f'[{idx}]' for idx in failed_indexes)} "
-                    f"签到失败, 请检查 Cookie 是否完整/过期 ({DOMAIN} 需要 "
-                    f"{' 与 '.join(COOKIE_KEYS)} 两个字段, 缺 .sig 大多是复制时被截断了), "
-                    "或签到被判定为自动签到 (code 4, 需把 GLADOS_USER_AGENT 设为浏览器 "
-                    "navigator.userAgent)。"
+                summary = f"{summary}, 失败账号 {', '.join(f'[{idx}]' for idx in failed_indexes)}"
+                next_step = (
+                    f"请检查 Cookie 是否完整/过期 ({DOMAIN} 需要 {' 与 '.join(COOKIE_KEYS)} 两个字段), "
+                    f"或签到被判定为自动签到 (code 4, 需设置 {Config.ENV_USER_AGENT})"
                 )
 
     except Exception as e:
-        logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
+        logger.error(f"执行过程中发生未预期的错误: {e}")
         exit_code = EXIT_CHECKIN_FAILED
 
-    logger.info(f"{LogEmoji.END} 签到完成 (退出码 {exit_code})")
+    detail = f": {summary}" if summary else ""
+    if exit_code == EXIT_OK:
+        logger.info(f"签到完成{detail} (退出码 {exit_code})")
+    else:
+        logger.error(f"签到失败{detail} (退出码 {exit_code})")
+    if next_step:
+        logger.error(next_step)
+
     return exit_code
 
 

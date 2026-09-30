@@ -288,7 +288,6 @@ def test_api_get_requests_carry_no_content_type_or_referer(monkeypatch):
 def _config_with_cookie(monkeypatch, cookie: str, user_agent=None) -> checkin.Config:
     """在干净的环境里加载配置: 可选环境变量一律先清掉, 免得被本机环境干扰断言。"""
     monkeypatch.setenv(checkin.Config.ENV_COOKIES, cookie)
-    monkeypatch.delenv(checkin.Config.ENV_EXCHANGE_PLAN, raising=False)
     monkeypatch.delenv(checkin.Config.ENV_VERBOSE, raising=False)
     if user_agent is None:
         monkeypatch.delenv(checkin.Config.ENV_USER_AGENT, raising=False)
@@ -366,23 +365,6 @@ def test_config_warns_when_input_is_not_a_cookie(monkeypatch, caplog):
     assert COOKIE_SENTINEL not in caplog.text
 
 
-def test_config_warns_and_falls_back_when_exchange_plan_is_invalid(monkeypatch, caplog):
-    """失败模式: GLADOS_EXCHANGE_PLAN 写错时必须告警, 并退回默认计划。
-
-    静默吞掉的话, 用户以为自己在按 plan100 攒, 实际按 plan500 攒 —— 差 400 积分,
-    不告警根本看不出来。这条锁的是本次重构刚改写过的那段分支。
-    """
-    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
-    monkeypatch.setenv(checkin.Config.ENV_EXCHANGE_PLAN, "plan999")
-
-    with caplog.at_level("INFO"):
-        config = checkin.Config()
-
-    assert config.exchange_plan == checkin.Config.DEFAULT_EXCHANGE_PLAN
-    assert "plan999" in caplog.text
-    assert "无效" in caplog.text
-
-
 # --------------------------------------------------------------------------
 # 账号维度的退出码判定
 # --------------------------------------------------------------------------
@@ -394,7 +376,8 @@ class _FakeConfig:
     def __init__(self, cookie_count: int):
         self.cookies_list = [f"cookie-{i}" for i in range(cookie_count)]
         self.verbose = False
-        self.exchange_plan = "plan500"
+        self.EXCHANGE_PLAN = checkin.Config.EXCHANGE_PLAN
+        self.EXCHANGE_PLAN_POINTS = checkin.Config.EXCHANGE_PLAN_POINTS
 
 
 def _result(cookie_index: int, code: checkin.CheckinStatus) -> checkin.CheckinResult:
@@ -499,15 +482,13 @@ def test_main_returns_2_when_cookie_env_is_missing(monkeypatch, _stub_api):
     assert checkin.main() == checkin.EXIT_CONFIG_ERROR
 
 
-def test_verbose_summary_reports_the_points_earned_by_this_checkin(monkeypatch, _stub_api, caplog):
-    """需求: verbose 明细里的「获得 N 积分」必须是本次签到真正拿到的积分。
+def test_result_line_reports_the_points_earned_by_this_checkin(monkeypatch, _stub_api, caplog):
+    """需求: 结果行里的「获得 N 积分」必须是本次签到真正拿到的积分。
 
-    回归的是 CheckinResult.points 从未被赋值 (于是 P: 恒为 0、这句话恒为"获得 0 积分")
-    这个 bug —— 它曾经在没有任何测试会因此变红的情况下存在了很久。
-    这也是 verbose 分支唯一的覆盖: 之前没有任何测试把 GLADOS_VERBOSE 打开过。
+    回归的是 CheckinResult.points 从未被赋值 (于是这里恒为"获得 0 积分") 那个 bug ——
+    它曾经在没有任何测试会因此变红的情况下存在了很久。
     """
     monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
-    monkeypatch.setenv(checkin.Config.ENV_VERBOSE, "true")
     _stub_api["checkin_points"] = "13"
 
     with caplog.at_level("INFO"):
@@ -515,7 +496,42 @@ def test_verbose_summary_reports_the_points_earned_by_this_checkin(monkeypatch, 
 
     assert exit_code == checkin.EXIT_OK
     assert "获得 13 积分" in caplog.text
-    assert "P:13" in caplog.text
+
+
+def test_verbose_logs_the_wire_traffic_without_leaking_the_cookie(monkeypatch, caplog):
+    """需求: 详细日志要能看到线上流量 (方法 / 路径 / 状态码 / 响应体)。
+
+    这是详细日志存在的全部意义 —— 排查服务端到底回了什么。同时也是一条安全约束:
+    请求头从不进日志, 所以 Cookie 值不得出现在任何一条详细日志里。
+    """
+    api = checkin.API(1, verbose=True)
+
+    with caplog.at_level("INFO"):
+        _capture_request(
+            monkeypatch,
+            {"code": 1, "message": "Today's observation logged."},
+            lambda: api.checkin(GLADOS_COOKIE),
+        )
+
+    logged = caplog.text
+    assert "POST" in logged and "/api/user/checkin" in logged, logged
+    assert "Today's observation logged." in logged, logged
+    assert GLADOS_COOKIE not in logged
+    assert COOKIE_SENTINEL not in logged
+
+
+def test_wire_traffic_is_not_logged_when_verbose_is_off(monkeypatch, caplog):
+    """需求: 详细日志关着的时候, 线上流量不该出现在日志里 (默认日志要短)。"""
+    api = checkin.API(1)
+
+    with caplog.at_level("INFO"):
+        _capture_request(
+            monkeypatch,
+            {"code": 1, "message": "Today's observation logged."},
+            lambda: api.checkin(GLADOS_COOKIE),
+        )
+
+    assert "/api/user/checkin" not in caplog.text, caplog.text
 
 
 # --------------------------------------------------------------------------
@@ -531,7 +547,6 @@ def test_no_exchange_request_when_points_are_below_the_plan_threshold(monkeypatc
     够不够当场就能判断, 没必要去问服务端。
     """
     monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
-    monkeypatch.delenv(checkin.Config.ENV_EXCHANGE_PLAN, raising=False)
     _stub_api["points"] = 497
 
     assert checkin.main() == checkin.EXIT_OK
@@ -541,7 +556,6 @@ def test_no_exchange_request_when_points_are_below_the_plan_threshold(monkeypatc
 def test_exchange_request_is_sent_once_points_reach_the_threshold(monkeypatch, _stub_api):
     """边界: 刚好够就必须兑换 —— 门槛判断写成 > 而不是 >= 会永远差一分不兑换。"""
     monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
-    monkeypatch.delenv(checkin.Config.ENV_EXCHANGE_PLAN, raising=False)
     _stub_api["points"] = 500
 
     assert checkin.main() == checkin.EXIT_OK
@@ -579,14 +593,13 @@ def test_exchange_failure_does_not_fail_the_run(monkeypatch, _stub_api):
     assert checkin.main() == checkin.EXIT_OK
 
 
-def test_exchange_requests_use_the_configured_plan(monkeypatch, _stub_api):
-    """需求: GLADOS_EXCHANGE_PLAN 要真的传下去, 不是永远发默认计划。"""
+def test_exchange_uses_the_hardcoded_plan500(monkeypatch, _stub_api):
+    """需求: 兑换固定用 plan500 —— 计划选择已经去掉, 别又长出一个开关来。"""
     monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
-    monkeypatch.setenv(checkin.Config.ENV_EXCHANGE_PLAN, "plan100")
-    _stub_api["points"] = 100
+    _stub_api["points"] = checkin.Config.EXCHANGE_PLAN_POINTS
 
     assert checkin.main() == checkin.EXIT_OK
-    assert set(_stub_api["exchange_calls"]) == {"plan100"}
+    assert set(_stub_api["exchange_calls"]) == {checkin.Config.EXCHANGE_PLAN}
 
 
 
@@ -711,7 +724,8 @@ def test_e2e_invalid_cookie_against_live_api_exits_nonzero_with_actionable_log()
     assert "gld:sess" in combined
     # 这里必须瞄准 main() 的账号级汇总那一句: 只写"签到失败"会被结果行
     # "🍪[1] ⚠️  结果: 签到失败" 满足, 于是删掉整段汇总也照样绿。
-    assert "Cookie [1] 签到失败, 请检查 Cookie 是否完整/过期" in proc.stderr
+    assert "失败账号 [1]" in proc.stderr
+    assert "请检查 Cookie 是否完整/过期" in proc.stderr
     assert COOKIE_SENTINEL not in combined
 
 
