@@ -41,7 +41,11 @@ def _gate_script() -> str:
     with open(WORKFLOW_PATH, encoding="utf-8") as handle:
         workflow = yaml.safe_load(handle)
 
-    steps = [s for s in workflow["jobs"]["build"]["steps"] if s.get("id") == "today"]
+    # 不写死作业名 (它被改过名), 但要求只有一个作业 —— 否则下面取 steps 就没意义了。
+    jobs = workflow["jobs"]
+    assert len(jobs) == 1, f"workflow 应当只有一个作业, 实际有 {list(jobs)}"
+    (job,) = jobs.values()
+    steps = [s for s in job["steps"] if s.get("id") == "today"]
     assert len(steps) == 1, f"workflow 里应当有且只有一个 id: today 的步骤, 实际 {len(steps)} 个"
     return steps[0]["run"]
 

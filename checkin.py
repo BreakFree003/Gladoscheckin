@@ -4,7 +4,7 @@ import os
 import sys
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from logging_config import init_logger
 
 
@@ -44,8 +44,8 @@ PERMISSION_ERROR_HINTS: Tuple[str, ...] = ("没有权限", "no permission")
 """GLaDOS 判定「自动签到」时返回的 code 与关键字。
 
 2026-09 实测: 同一份 Cookie, User-Agent 平台对不上登录浏览器时,
-/api/user/checkin 返回 code 4「Automated check-in detected」, 而
-status/points 等接口照常工作, 很容易被误判成 Cookie 失效。"""
+/api/user/checkin 返回 code 4「Automated check-in detected」, 而积分接口照常返回,
+很容易被误判成 Cookie 失效。"""
 AUTOMATION_ERROR_CODE = 4
 AUTOMATION_ERROR_HINTS: Tuple[str, ...] = ("automated check-in detected",)
 
@@ -104,7 +104,6 @@ def log_method(func):
 
             DEFAULT_ERRORS = {
                 "checkin": {"status": "签到失败", "points": "0", "message": ""},
-                "get_status": ("None 天", -2),
                 "get_points": ("None 积分", 0),
                 "exchange": "",
             }
@@ -195,7 +194,6 @@ class API:
     """API 调用"""
 
     CHECKIN_URL = "/api/user/checkin"
-    STATUS_URL = "/api/user/status"
     POINTS_URL = "/api/user/points"
     EXCHANGE_URL = "/api/user/exchange"
 
@@ -404,30 +402,6 @@ class API:
         return result
 
     @log_method
-    def get_status(self, cookies: str) -> Tuple[str, int]:
-        """获取剩余天数。第二个返回值只是给详细日志用的原始 code。"""
-        url = self._get_full_url(self.STATUS_URL)
-        response = self._make_request(url, "GET", cookies=cookies)
-
-        if response:
-            data = response.json()
-            code = data.get("code", -2)
-            message = data.get("message", "")
-            left_days = data.get("data", {}).get("leftDays", None)
-
-            if left_days is not None:
-                return f"{int(float(left_days))} 天", code
-
-            # 权限问题的解释统一交给 _report_auth_error 打一次, 这里不再重说一遍。
-            if is_permission_error(code, message):
-                self._report_auth_error("status", message)
-            else:
-                self._log("warning", f"读取剩余天数失败: {response.text}")
-            return "None 天", code
-
-        return "None 天", -2
-
-    @log_method
     def get_points(self, cookies: str) -> Tuple[str, int]:
         """获取总积分。第二个返回值是给兑换门槛用的数字。"""
         url = self._get_full_url(self.POINTS_URL)
@@ -467,9 +441,8 @@ class API:
             message = data.get("message", "未知错误")
 
             if code == CheckinStatus.SUCCESS.value:
-                # 兑换会真扣掉几百积分, 是"改变账号状态"的操作, 不管有没有开详细日志
-                # 都必须留痕 —— 否则成功时反而在日志里什么都看不到。
-                self._log("info", f"兑换成功: {plan} (code {code}, message: {message})")
+                # 兑换成功不在这里记: 调用方的结果行一定会带上"兑换成功: plan500",
+                # 而且是无条件输出 —— 它会真扣掉 500 积分, 不能只在某处悄悄发生。
                 return f"兑换成功: {plan}"
 
             self._log("error", f"兑换失败: {plan} (code {code}, message: {message})")
@@ -487,13 +460,9 @@ class CheckinResult:
     cookie_index: int
     status: str = "签到失败"
     points: str = "0"
-    days: str = "None"
     points_total: str = "None"
-    exchange: str = "未兑换"
+    exchange: str = ""
     code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
-
-    def to_dict(self) -> Dict[str, Union[str, CheckinStatus]]:
-        return asdict(self)
 
 
 class Checker:
@@ -524,7 +493,7 @@ class Checker:
 
     @staticmethod
     def _describe(result: CheckinResult) -> str:
-        """把单个账号的结果拼成一行: 状态 + 本次获得/剩余/总积分 + 兑换情况。"""
+        """把单个账号的结果拼成一行: 状态 + 本次获得 + 总积分 + 兑换情况。"""
         emoji = {
             CheckinStatus.SUCCESS: LogEmoji.SUCCESS,
             CheckinStatus.REPEAT: LogEmoji.REPEAT,
@@ -534,39 +503,36 @@ class Checker:
         line = f"{emoji} {result.status}"
         if result.code is CheckinStatus.FAILURE:
             return line
-        return f"{line}, 获得 {result.points} 积分, 剩余 {result.days}, 总 {result.points_total}, {result.exchange}"
+
+        # 重复签到时没有"获得"可言, 硬写一句"获得 0 积分"看着像 bug。
+        earned = f"获得 {result.points} 积分, " if result.code is CheckinStatus.SUCCESS else ""
+        return f"{line}, {earned}总 {result.points_total}, {result.exchange}"
 
     def _checkin_account(self, cookie: str, cookie_idx: int) -> CheckinResult:
-        """一个账号的完整流程: 查状态 -> 签到 -> 查积分 -> 达标才兑换。"""
+        """一个账号的完整流程: 签到 -> 查总积分 -> 达标才兑换。"""
         result = CheckinResult(cookie_idx)
 
         with API(cookie_idx, user_agent=self.config.user_agent) as api:
-            # 1. 剩余天数 (只进详细日志的结果行, 默认日志里靠签到结果说话)
-            result.days, _ = api.get_status(cookie)
-
-            # 2. 签到
+            # 1. 签到
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
             result.points = checkin_result.get("points", "0")
 
-            # 3. 总积分
+            # 2. 总积分
             points_str, points_num = api.get_points(cookie)
             result.points_total = points_str
 
-            # 4. 兑换: 积分没到门槛就不发这个请求。服务端对积分不够只会回
+            # 3. 兑换: 积分没到门槛就不发这个请求。服务端对积分不够只会回
             #    "Not enough points", 每天发一次、再报一次错既没用又像是故障。
+            #    这里只写门槛, 不重复余额 —— 结果行里刚打过总积分。
             required_points = self.config.EXCHANGE_PLAN_POINTS
             if points_num < required_points:
-                result.exchange = f"未兑换 (积分 {points_num}/{required_points})"
+                result.exchange = f"未到 {required_points} 兑换门槛"
             else:
                 result.exchange = api.exchange(cookie, self.config.EXCHANGE_PLAN)
 
         return result
-
-    def get_results(self) -> List[Dict[str, str]]:
-        """获取所有结果"""
-        return [result.to_dict() for result in self.results]
 
     def failed_cookie_indexes(self) -> List[int]:
         """返回未签到成功 (也没重复签到) 的 Cookie 序号。
@@ -575,9 +541,9 @@ class Checker:
         某个账号没有结果 (例如中途异常) 也算失败 —— 宁可报红, 也不能静默漏签。
         """
         succeeded = {
-            result["cookie_index"]
-            for result in self.get_results()
-            if result["code"] in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
+            result.cookie_index
+            for result in self.results
+            if result.code in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
         }
         return [
             idx
@@ -587,10 +553,9 @@ class Checker:
 
     def format_results(self) -> str:
         """汇总一行: 成功/失败/重复 各多少个账号。"""
-        results = self.get_results()
-        success = sum(1 for r in results if r["code"] == CheckinStatus.SUCCESS)
-        repeat = sum(1 for r in results if r["code"] == CheckinStatus.REPEAT)
-        fail = sum(1 for r in results if r["code"] == CheckinStatus.FAILURE)
+        success = sum(1 for r in self.results if r.code is CheckinStatus.SUCCESS)
+        repeat = sum(1 for r in self.results if r.code is CheckinStatus.REPEAT)
+        fail = sum(1 for r in self.results if r.code is CheckinStatus.FAILURE)
         return f"成功 {success}, 失败 {fail}, 重复 {repeat}"
 
 

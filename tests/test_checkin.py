@@ -269,8 +269,8 @@ def test_api_get_requests_carry_no_content_type_or_referer(monkeypatch):
 
     recorded = _capture_request(
         monkeypatch,
-        {"code": 0, "data": {"leftDays": "10"}},
-        lambda: api.get_status(GLADOS_COOKIE),
+        {"code": 0, "points": 497},
+        lambda: api.get_points(GLADOS_COOKIE),
     )
 
     assert recorded["method"] == "GET"
@@ -379,7 +379,7 @@ class _FakeConfig:
 
 
 def _result(cookie_index: int, code: checkin.CheckinStatus) -> checkin.CheckinResult:
-    """Checker.results 实际存放的是 CheckinResult 实例 (get_results() 才转成 dict)。"""
+    """Checker.results 存放的就是 CheckinResult 实例 (不再有 dict 中转层)。"""
     return checkin.CheckinResult(cookie_index, code=code)
 
 
@@ -431,7 +431,6 @@ def _stub_api(monkeypatch):
         "exchange_calls": [],
     }
 
-    monkeypatch.setattr(checkin.API, "get_status", lambda self, cookies: ("42 天", 0))
     monkeypatch.setattr(
         checkin.API, "get_points", lambda self, cookies: (f"{state['points']} 积分", state["points"])
     )
@@ -544,25 +543,34 @@ def test_exchange_request_is_sent_once_points_reach_the_threshold(monkeypatch, _
     assert set(_stub_api["exchange_calls"]) == {"plan500"}
 
 
-def test_exchange_success_is_always_logged(monkeypatch, caplog):
+def test_a_successful_exchange_is_visible_in_the_log(monkeypatch, caplog):
     """需求: 兑换成功必须留痕。
 
-    它是一次扣掉几百积分、改变账号状态的操作, 所以必须无条件留痕 ——
+    它是一次扣掉 500 积分、改变账号状态的操作, 所以必须无条件留痕 ——
     否则成功兑换这种最该知道的事, 反而在日志里什么都看不到。
     回归的就是"积分够了、兑换也成功了, 但日志里一个字都没有"这个观测盲区。
-    这里必须打真 API.exchange: 把 API 层 stub 掉就等于在测 stub 自己。
+
+    留痕的位置是每个账号的结果行 (无条件输出)。这里只换掉网络层, checkin /
+    get_points / exchange / Checker / 结果行全部走真代码 —— 把其中任何一层 stub 掉,
+    就等于在测 stub 自己。
     """
-    api = checkin.API(1)
-    monkeypatch.setattr(
-        checkin.API,
-        "_make_request",
-        lambda self, url, method, data=None, cookies="": _FakeResponse({"code": 0, "message": "ok"}),
-    )
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
+
+    def fake_make_request(self, url, method, data=None, cookies=""):
+        if url.endswith(checkin.API.POINTS_URL):
+            return _FakeResponse({"code": 0, "points": checkin.Config.EXCHANGE_PLAN_POINTS})
+        if url.endswith(checkin.API.EXCHANGE_URL):
+            return _FakeResponse({"code": 0, "message": "ok"})
+        return _FakeResponse({"code": 0, "points": 13, "message": "checkin ok"})
+
+    monkeypatch.setattr(checkin.API, "_make_request", fake_make_request)
 
     with caplog.at_level("INFO"):
-        assert api.exchange(GLADOS_COOKIE, "plan500") == "兑换成功: plan500"
+        exit_code = checkin.main()
 
-    assert any("兑换成功" in record.getMessage() for record in caplog.records), caplog.text
+    assert exit_code == checkin.EXIT_OK
+    assert checkin.Config.EXCHANGE_PLAN in caplog.text, caplog.text
+    assert "兑换成功" in caplog.text, caplog.text
 
 
 def test_exchange_failure_does_not_fail_the_run(monkeypatch, _stub_api):
