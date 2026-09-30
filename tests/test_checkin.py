@@ -1,12 +1,9 @@
 """checkin.py 的测试。
 
 覆盖的失败模式 (来自 2026-09-24 起线上 Actions 日志与上游 issue #37):
-- GLaDOS 自 2026-09 起把会话 Cookie 拆成两套: glados.cloud 用 gld:sess/gld:sess.sig,
-  railgun.info 用 koa:sess/koa:sess.sig (上游 issue #37 评论 5845370610 的实测反馈)。
-  只在一个站点注册的用户只能拿到其中一对, 因此「没有一对完整」才是配置错误。
+- GLaDOS 自 2026-09 起把会话 Cookie 拆成了 gld:sess / gld:sess.sig 两个字段,
+  缺一个就不能签到 (只抄半对是常见错误, 所以要在加载期就告警)。
 - 旧版本脚本把失败咽掉, 进程退出码始终为 0, 于是 Actions 显示绿色但实际没签到。
-- 同一个 Cookie 会依次请求 glados.cloud 与 railgun.info, 通常只有其中一个站点
-  持有该账号, 另一个必然返回 -2；这属于正常现象, 不应判定为账号失败。
 """
 
 import json
@@ -25,13 +22,15 @@ import checkin  # noqa: E402  (需要先注入仓库根目录到 sys.path)
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COOKIE_SENTINEL = "SENTINEL_VALUE_MUST_NOT_BE_LOGGED"
 
-GLADOS_SITE_COOKIE = f"gld:sess={COOKIE_SENTINEL}_gsess; gld:sess.sig={COOKIE_SENTINEL}_gsig"
-RAILGUN_SITE_COOKIE = f"koa:sess={COOKIE_SENTINEL}_sess; koa:sess.sig={COOKIE_SENTINEL}_sig"
-BOTH_SITES_COOKIE = f"{GLADOS_SITE_COOKIE}; {RAILGUN_SITE_COOKIE}"
-# 两对会话字段都不完整: 只有 gld:sess (缺 .sig), koa 那对完全没有
+GLADOS_COOKIE = f"gld:sess={COOKIE_SENTINEL}_gsess; gld:sess.sig={COOKIE_SENTINEL}_gsig"
+# 只有会话字段的一半 (缺 .sig), 也是从浏览器复制时最常见的截断形态
 INCOMPLETE_SESSION_COOKIE = f"gld:sess={COOKIE_SENTINEL}_gsess; theme=dark"
-# 完全不像 Cookie 的输入
+# 站点历史上前端用的是另一套字段名, 拿错那套时同样是坏的
+OTHER_SITE_COOKIE = f"koa:sess={COOKIE_SENTINEL}_sess; koa:sess.sig={COOKIE_SENTINEL}_sig"
+# 完全不像这个站点 Cookie 的输入
 NON_COOKIE_INPUT = f"not-a-cookie={COOKIE_SENTINEL}"
+# 两个账号, 用 & 分隔
+TWO_ACCOUNTS_COOKIES = f"{GLADOS_COOKIE}&{GLADOS_COOKIE}"
 
 # --------------------------------------------------------------------------
 # Cookie 结构解析
@@ -40,45 +39,24 @@ NON_COOKIE_INPUT = f"not-a-cookie={COOKIE_SENTINEL}"
 
 def test_parse_cookie_keys_returns_field_names_without_values():
     """需求: 解析只给出字段名, 任何日志路径都不得泄露 Cookie 值。"""
-    keys = checkin.parse_cookie_keys(BOTH_SITES_COOKIE)
+    keys = checkin.parse_cookie_keys(GLADOS_COOKIE)
 
-    assert keys == ["gld:sess", "gld:sess.sig", "koa:sess", "koa:sess.sig"]
+    assert keys == ["gld:sess", "gld:sess.sig"]
     assert all(COOKIE_SENTINEL not in key for key in keys)
 
 
 def test_parse_cookie_keys_tolerates_missing_spaces_and_trailing_semicolon():
     """失败模式: 用户从浏览器复制的 Cookie 分隔符不规范时不应解析错位。"""
-    keys = checkin.parse_cookie_keys("koa:sess=a;koa:sess.sig=b; gld:sess=c;;")
+    keys = checkin.parse_cookie_keys("gld:sess=a;gld:sess.sig=b; theme=dark;;")
 
-    assert keys == ["koa:sess", "koa:sess.sig", "gld:sess"]
-
-
-def test_complete_cookie_sites_matches_each_site_own_pair():
-    """需求: gld 那对属 glados.cloud、koa 那对属 railgun.info, 两对齐全则两个站点都算。
-
-    期望值来自上游 issue #37 评论里两类用户的实测: 单站点用户手里只有一对 Cookie。
-    """
-    assert checkin.complete_cookie_sites(GLADOS_SITE_COOKIE) == ["glados.cloud"]
-    assert checkin.complete_cookie_sites(RAILGUN_SITE_COOKIE) == ["railgun.info"]
-    assert checkin.complete_cookie_sites(BOTH_SITES_COOKIE) == [
-        "glados.cloud",
-        "railgun.info",
-    ]
+    assert keys == ["gld:sess", "gld:sess.sig", "theme"]
 
 
-def test_complete_cookie_sites_rejects_partial_or_non_cookie_input():
-    """失败模式: 只抄了半对 / 根本没抄会话字段时必须判定为没有可用站点。"""
-    assert checkin.complete_cookie_sites(INCOMPLETE_SESSION_COOKIE) == []
-    assert checkin.complete_cookie_sites(NON_COOKIE_INPUT) == []
-
-
-def test_missing_cookie_keys_reports_only_requested_fields():
-    """需求: 缺字段诊断只针对给定站点那一对, 不把另一站点的字段算成缺失。"""
-    assert checkin.missing_cookie_keys(GLADOS_SITE_COOKIE, checkin.SITE_COOKIE_KEYS["glados.cloud"]) == []
-    assert checkin.missing_cookie_keys(GLADOS_SITE_COOKIE, checkin.SITE_COOKIE_KEYS["railgun.info"]) == [
-        "koa:sess",
-        "koa:sess.sig",
-    ]
+def test_missing_cookie_keys_reports_the_incomplete_pair():
+    """需求: 缺字段诊断只报真正缺的那几个, 不把无关字段算进来。"""
+    assert checkin.missing_cookie_keys(GLADOS_COOKIE) == []
+    assert checkin.missing_cookie_keys(INCOMPLETE_SESSION_COOKIE) == ["gld:sess.sig"]
+    assert checkin.missing_cookie_keys(NON_COOKIE_INPUT) == ["gld:sess", "gld:sess.sig"]
 
 
 # --------------------------------------------------------------------------
@@ -90,7 +68,7 @@ def test_missing_cookie_keys_reports_only_requested_fields():
     "code,message,expected",
     [
         (-2, "没有权限", True),  # glados.cloud 实测响应
-        (-2, "No permission", True),  # railgun.info 实测响应
+        (-2, "No permission", True),  # 站点英文文案
         (-2, "NO PERMISSION", True),  # 大小写不敏感
         (1, "Today's observation logged. Return tomorrow for more points.", False),
         (1, "Not enough points. Need 500, have 320.0000000000000000", False),
@@ -127,7 +105,7 @@ def test_is_automation_blocked_distinguishes_code_4_from_auth_failure(code, mess
 def test_config_uses_default_user_agent_when_env_absent(monkeypatch):
     """需求: 未配置 GLADOS_USER_AGENT 时使用能通过校验的默认 UA。"""
     monkeypatch.delenv(checkin.Config.ENV_USER_AGENT, raising=False)
-    config = _config_with_cookie(monkeypatch, BOTH_SITES_COOKIE)
+    config = _config_with_cookie(monkeypatch, GLADOS_COOKIE)
 
     assert config.user_agent == checkin.Config.DEFAULT_USER_AGENT
     assert "Windows" not in config.user_agent  # 实测 Windows UA 会被判定为自动签到
@@ -136,7 +114,7 @@ def test_config_uses_default_user_agent_when_env_absent(monkeypatch):
 def test_config_user_agent_can_be_overridden_by_env(monkeypatch):
     """需求: 登录平台不是 macOS 的用户必须能用 GLADOS_USER_AGENT 覆盖。"""
     config = _config_with_cookie(
-        monkeypatch, BOTH_SITES_COOKIE, user_agent="UA_FROM_USER_BROWSER"
+        monkeypatch, GLADOS_COOKIE, user_agent="UA_FROM_USER_BROWSER"
     )
 
     assert config.user_agent == "UA_FROM_USER_BROWSER"
@@ -144,10 +122,10 @@ def test_config_user_agent_can_be_overridden_by_env(monkeypatch):
 
 def test_api_sends_the_configured_user_agent(monkeypatch):
     """失败模式: 配置了 UA 但请求仍带旧硬编码 UA, 会继续被 code 4 拦下。"""
-    config = _config_with_cookie(monkeypatch, BOTH_SITES_COOKIE)
+    config = _config_with_cookie(monkeypatch, GLADOS_COOKIE)
     config.user_agent = "UA_MUST_REACH_THE_WIRE"
 
-    assert checkin.API("glados.cloud", 1, user_agent=config.user_agent).headers["user-agent"] == (
+    assert checkin.API(1, user_agent=config.user_agent).headers["user-agent"] == (
         "UA_MUST_REACH_THE_WIRE"
     )
 
@@ -229,12 +207,12 @@ def test_checkin_wire_request_matches_the_captured_browser_request(monkeypatch):
     """
     capture = _browser_capture()
     browser = capture["request"]
-    api = checkin.API("glados.cloud", 1, user_agent=capture["browser"]["user_agent"])
+    api = checkin.API(1, user_agent=capture["browser"]["user_agent"])
 
     recorded = _capture_request(
         monkeypatch,
         {"code": 1, "message": "Today's observation logged."},
-        lambda: api.checkin(BOTH_SITES_COOKIE),
+        lambda: api.checkin(GLADOS_COOKIE),
     )
 
     assert recorded["method"] == browser["method"] == "POST"
@@ -243,7 +221,7 @@ def test_checkin_wire_request_matches_the_captured_browser_request(monkeypatch):
     assert len(recorded["body"]) == browser["contentLength"]
     for name in ("accept", "content-type", "origin", "user-agent", "content-length"):
         assert recorded["headers"][name] == browser["headers"][name], name
-    assert recorded["headers"]["cookie"] == BOTH_SITES_COOKIE
+    assert recorded["headers"]["cookie"] == GLADOS_COOKIE
 
 
 def test_checkin_sends_no_header_the_browser_never_sends(monkeypatch):
@@ -258,9 +236,9 @@ def test_checkin_sends_no_header_the_browser_never_sends(monkeypatch):
     # HTTP/1.1 客户端自带、而浏览器走 h2 时不会出现的两个头
     client_only = {"host", "connection"}
 
-    api = checkin.API("glados.cloud", 1)
+    api = checkin.API(1)
     recorded = _capture_request(
-        monkeypatch, {"code": 1, "message": "repeat"}, lambda: api.checkin(BOTH_SITES_COOKIE)
+        monkeypatch, {"code": 1, "message": "repeat"}, lambda: api.checkin(GLADOS_COOKIE)
     )
 
     unexpected = set(recorded["headers"]) - browser_headers - client_only
@@ -271,11 +249,11 @@ def test_checkin_sends_no_header_the_browser_never_sends(monkeypatch):
 
 def test_api_exchange_posts_compact_json_plan_type_like_the_web_console(monkeypatch):
     """失败模式: 兑换请求体不是网页端那种紧凑 JSON, 或少了 content-type。"""
-    api = checkin.API("railgun.info", 1)
+    api = checkin.API(1)
 
     recorded = _capture_request(
         monkeypatch, {"code": 0, "message": "ok"},
-        lambda: api.exchange(BOTH_SITES_COOKIE, "plan500"),
+        lambda: api.exchange(GLADOS_COOKIE, "plan500"),
     )
 
     assert recorded["path"] == "/api/user/exchange"
@@ -285,18 +263,18 @@ def test_api_exchange_posts_compact_json_plan_type_like_the_web_console(monkeypa
 
 def test_api_get_requests_carry_no_content_type_or_referer(monkeypatch):
     """失败模式: 把 POST 才有的 content-type 也塞给 GET, 与浏览器不一致。"""
-    api = checkin.API("glados.cloud", 1)
+    api = checkin.API(1)
 
     recorded = _capture_request(
         monkeypatch,
         {"code": 0, "data": {"leftDays": "10"}},
-        lambda: api.get_status(BOTH_SITES_COOKIE),
+        lambda: api.get_status(GLADOS_COOKIE),
     )
 
     assert recorded["method"] == "GET"
     assert "content-type" not in recorded["headers"]
     assert "referer" not in recorded["headers"]
-    assert recorded["headers"]["cookie"] == BOTH_SITES_COOKIE
+    assert recorded["headers"]["cookie"] == GLADOS_COOKIE
 
 
 
@@ -306,7 +284,10 @@ def test_api_get_requests_carry_no_content_type_or_referer(monkeypatch):
 
 
 def _config_with_cookie(monkeypatch, cookie: str, user_agent=None) -> checkin.Config:
+    """在干净的环境里加载配置: 可选环境变量一律先清掉, 免得被本机环境干扰断言。"""
     monkeypatch.setenv(checkin.Config.ENV_COOKIES, cookie)
+    monkeypatch.delenv(checkin.Config.ENV_EXCHANGE_PLAN, raising=False)
+    monkeypatch.delenv(checkin.Config.ENV_VERBOSE, raising=False)
     if user_agent is None:
         monkeypatch.delenv(checkin.Config.ENV_USER_AGENT, raising=False)
     else:
@@ -314,70 +295,89 @@ def _config_with_cookie(monkeypatch, cookie: str, user_agent=None) -> checkin.Co
     return checkin.Config()
 
 
-def _assert_no_cookie_warning(caplog, cookie: str) -> None:
-    """加载期不应出现任何针对 Cookie 字段的告警 (未配置兑换计划之类的告警不算)。"""
-    text = caplog.text
-    assert "会话字段" not in text, text
-    assert cookie not in text
-    assert COOKIE_SENTINEL not in text
+def _assert_no_config_warning(caplog, cookie: str) -> None:
+    """正常配置在加载期一条告警都不该有, 而且任何级别的日志都不得出现 Cookie 值。
 
-
-def test_config_accepts_glados_only_cookie_without_warning(monkeypatch, caplog):
-    """需求: 只在 glados.cloud 注册的用户手里只有 gld 那一对, 不得报缺失告警。
-
-    对应上游 issue #37 评论 5845370610 第 1 条。
+    不设可选的 GLADOS_EXCHANGE_PLAN / GLADOS_VERBOSE 是最常见的正常状态,
+    让正常路径冒 ⚠️ 会训练人忽略警告, 真正的异常反而看不见。
     """
-    with caplog.at_level("WARNING"):
-        config = _config_with_cookie(monkeypatch, GLADOS_SITE_COOKIE)
+    warnings = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
+    assert warnings == [], warnings
+    assert cookie not in caplog.text
+    assert COOKIE_SENTINEL not in caplog.text
 
-    assert config.cookies_list == [GLADOS_SITE_COOKIE]
-    _assert_no_cookie_warning(caplog, GLADOS_SITE_COOKIE)
+
+def test_config_accepts_complete_cookie_without_warning(monkeypatch, caplog):
+    """需求: 会话字段齐全的正常 Cookie 不得产生告警 (且加载日志里不得出现 Cookie 值)。"""
+    with caplog.at_level("INFO"):
+        config = _config_with_cookie(monkeypatch, GLADOS_COOKIE)
+
+    assert config.cookies_list == [GLADOS_COOKIE]
+    _assert_no_config_warning(caplog, GLADOS_COOKIE)
 
 
-def test_config_accepts_railgun_only_cookie_without_warning(monkeypatch, caplog):
-    """需求: 只在 railgun.info 注册的用户手里只有 koa 那一对, 不得报缺失告警。
+def test_config_accepts_cookie_with_extra_unrelated_fields_without_warning(monkeypatch, caplog):
+    """需求: 从浏览器复制出来的 Cookie 常带着 theme 之类的无关字段, 不该因此告警。"""
+    cookie = f"{GLADOS_COOKIE}; theme=dark; _ga=GA1.1.123456"
+    with caplog.at_level("INFO"):
+        config = _config_with_cookie(monkeypatch, cookie)
 
-    对应上游 issue #37 评论 5845370610 第 2 条。
+    assert config.cookies_list == [cookie]
+    _assert_no_config_warning(caplog, cookie)
+
+
+def test_config_warns_for_cookie_from_the_other_site(monkeypatch, caplog):
+    """失败模式: 站点把会话拆成了两套字段, 拿成另一套 (koa:*) 时必须告警。
+
+    这个脚本只服务 glados.cloud, 所以 koa:* 这类外站字段等价于「缺 gld:*」——
+    照旧静默通过的话, 用户只会在签到失败时才发现 Cookie 拿错了。
     """
-    with caplog.at_level("WARNING"):
-        config = _config_with_cookie(monkeypatch, RAILGUN_SITE_COOKIE)
+    with caplog.at_level("INFO"):
+        config = _config_with_cookie(monkeypatch, OTHER_SITE_COOKIE)
 
-    assert config.cookies_list == [RAILGUN_SITE_COOKIE]
-    _assert_no_cookie_warning(caplog, RAILGUN_SITE_COOKIE)
-
-
-def test_config_accepts_both_sites_cookie_without_warning(monkeypatch, caplog):
-    """需求: 两个站点都有账号时把两对拼在一起, 同样不应产生告警。"""
-    with caplog.at_level("WARNING"):
-        config = _config_with_cookie(monkeypatch, BOTH_SITES_COOKIE)
-
-    assert config.cookies_list == [BOTH_SITES_COOKIE]
-    _assert_no_cookie_warning(caplog, BOTH_SITES_COOKIE)
+    assert config.cookies_list == [OTHER_SITE_COOKIE]
+    assert "缺少会话字段" in caplog.text
+    assert "gld:sess" in caplog.text
+    assert COOKIE_SENTINEL not in caplog.text
 
 
-def test_config_warns_when_no_complete_session_pair_without_leaking_values(monkeypatch, caplog):
-    """失败模式: 连一对完整会话字段都没有时必须在加载阶段给出可操作警告, 且不打印 Cookie 值。"""
-    with caplog.at_level("WARNING"):
+def test_config_warns_when_session_fields_are_incomplete_without_leaking_values(monkeypatch, caplog):
+    """失败模式: 只抄了半对时必须在加载阶段给出可操作警告, 且不打印 Cookie 值。"""
+    with caplog.at_level("INFO"):
         _config_with_cookie(monkeypatch, INCOMPLETE_SESSION_COOKIE)
 
     text = caplog.text
-    assert "没有一对完整的会话字段" in text
-    assert "gld:sess" in text
+    assert "缺少会话字段" in text
     assert "gld:sess.sig" in text
-    assert "koa:sess" in text
-    assert "koa:sess.sig" in text
     assert "GLADOS_COOKIES" in text
     assert COOKIE_SENTINEL not in text
 
 
 def test_config_warns_when_input_is_not_a_cookie(monkeypatch, caplog):
-    """失败模式: 完全不像 Cookie 的输入同样要提示两套会话字段的名称。"""
-    with caplog.at_level("WARNING"):
+    """失败模式: 完全不像 Cookie 的输入同样要提示需要的会话字段名称。"""
+    with caplog.at_level("INFO"):
         _config_with_cookie(monkeypatch, NON_COOKIE_INPUT)
 
-    assert "没有一对完整的会话字段" in caplog.text
+    assert "缺少会话字段" in caplog.text
     assert "gld:sess" in caplog.text
-    assert "koa:sess" in caplog.text
+    assert COOKIE_SENTINEL not in caplog.text
+
+
+def test_config_warns_and_falls_back_when_exchange_plan_is_invalid(monkeypatch, caplog):
+    """失败模式: GLADOS_EXCHANGE_PLAN 写错时必须告警, 并退回默认计划。
+
+    静默吞掉的话, 用户以为自己在按 plan100 攒, 实际按 plan500 攒 —— 差 400 积分,
+    不告警根本看不出来。这条锁的是本次重构刚改写过的那段分支。
+    """
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
+    monkeypatch.setenv(checkin.Config.ENV_EXCHANGE_PLAN, "plan999")
+
+    with caplog.at_level("INFO"):
+        config = checkin.Config()
+
+    assert config.exchange_plan == checkin.Config.DEFAULT_EXCHANGE_PLAN
+    assert "plan999" in caplog.text
+    assert "无效" in caplog.text
 
 
 # --------------------------------------------------------------------------
@@ -394,33 +394,36 @@ class _FakeConfig:
         self.exchange_plan = "plan500"
 
 
-def _result(cookie_index: int, domain: str, code: checkin.CheckinStatus) -> checkin.CheckinResult:
+def _result(cookie_index: int, code: checkin.CheckinStatus) -> checkin.CheckinResult:
     """Checker.results 实际存放的是 CheckinResult 实例 (get_results() 才转成 dict)。"""
-    return checkin.CheckinResult(cookie_index, domain, code=code)
+    return checkin.CheckinResult(cookie_index, code=code)
 
 
-def test_failed_cookie_indexes_ignores_domain_that_never_holds_the_account():
-    """需求: Cookie1 在 glados.cloud 成功、在 railgun.info 返回 -2 时, 账号视为成功。"""
-    checker = checkin.Checker(_FakeConfig(cookie_count=1))
-    checker.results = [
-        _result(1, "glados.cloud", checkin.CheckinStatus.SUCCESS),
-        _result(1, "railgun.info", checkin.CheckinStatus.FAILURE),
-    ]
+def test_failed_cookie_indexes_reports_only_accounts_that_did_not_succeed():
+    """失败模式: 线上 2026-09-24 起接口全返回 -2, 必须判定为账号失败。
 
-    assert checker.failed_cookie_indexes() == []
-
-
-def test_failed_cookie_indexes_reports_cookie_failing_on_every_domain():
-    """失败模式: 线上 2026-09-24 起两个域名都返回 -2, 必须判定为账号失败。"""
+    重复签到算成功 —— 那说明当天已经签过了, 不是故障。
+    """
     checker = checkin.Checker(_FakeConfig(cookie_count=2))
     checker.results = [
-        _result(1, "glados.cloud", checkin.CheckinStatus.FAILURE),
-        _result(1, "railgun.info", checkin.CheckinStatus.FAILURE),
-        _result(2, "glados.cloud", checkin.CheckinStatus.REPEAT),
-        _result(2, "railgun.info", checkin.CheckinStatus.FAILURE),
+        _result(1, checkin.CheckinStatus.FAILURE),
+        _result(2, checkin.CheckinStatus.REPEAT),
     ]
 
     assert checker.failed_cookie_indexes() == [1]
+
+
+def test_failed_cookie_indexes_treats_a_missing_result_as_failure():
+    """失败模式: 某个账号压根没跑出结果时, 不得当成成功。
+
+    这是整个脚本最要紧的一条约束 (宁可多签一次, 也绝不静默漏签): 判据必须以
+    配置里的账号数为准, 而不是以「跑出了几条结果」为准 —— 后者在中途异常时会
+    静默漏签还显示绿色。
+    """
+    checker = checkin.Checker(_FakeConfig(cookie_count=2))
+    checker.results = [_result(1, checkin.CheckinStatus.SUCCESS)]
+
+    assert checker.failed_cookie_indexes() == [2]
 
 
 # --------------------------------------------------------------------------
@@ -465,23 +468,23 @@ def _stub_api(monkeypatch):
     return state
 
 
-def test_main_returns_0_when_one_domain_succeeds(monkeypatch, _stub_api):
-    """需求: 只要账号在任一域名上签到成功/Actions 应为绿色 (退出码 0)。"""
-    monkeypatch.setenv(checkin.Config.ENV_COOKIES, BOTH_SITES_COOKIE)
+def test_main_returns_0_when_checkin_succeeds(monkeypatch, _stub_api):
+    """需求: 账号签到成功时 Actions 应为绿色 (退出码 0)。"""
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
 
     assert checkin.main() == checkin.EXIT_OK
 
 
-def test_main_returns_1_when_checkin_fails_on_all_domains(monkeypatch, _stub_api, caplog):
-    """失败模式: 所有域名都失败时必须返回非 0, 让 Actions 变红而不是假绿。"""
-    monkeypatch.setenv(checkin.Config.ENV_COOKIES, BOTH_SITES_COOKIE)
+def test_main_returns_1_when_checkin_fails(monkeypatch, _stub_api, caplog):
+    """失败模式: 账号签到失败时必须返回非 0, 让 Actions 变红而不是假绿。"""
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
     _stub_api["checkin_code"] = checkin.CheckinStatus.FAILURE
 
     with caplog.at_level("ERROR"):
         exit_code = checkin.main()
 
     assert exit_code == checkin.EXIT_CHECKIN_FAILED
-    assert "在所有域名上都未签到成功" in caplog.text
+    assert "请检查 Cookie 是否完整/过期" in caplog.text
 
 
 def test_main_returns_2_when_cookie_env_is_missing(monkeypatch, _stub_api):
@@ -503,7 +506,7 @@ def test_no_exchange_request_when_points_are_below_the_plan_threshold(monkeypatc
     于是每天多一次注定失败的请求 + 一条看着像故障的报错。积分是本脚本自己刚查过的,
     够不够当场就能判断, 没必要去问服务端。
     """
-    monkeypatch.setenv(checkin.Config.ENV_COOKIES, BOTH_SITES_COOKIE)
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
     monkeypatch.delenv(checkin.Config.ENV_EXCHANGE_PLAN, raising=False)
     _stub_api["points"] = 497
 
@@ -513,7 +516,7 @@ def test_no_exchange_request_when_points_are_below_the_plan_threshold(monkeypatc
 
 def test_exchange_request_is_sent_once_points_reach_the_threshold(monkeypatch, _stub_api):
     """边界: 刚好够就必须兑换 —— 门槛判断写成 > 而不是 >= 会永远差一分不兑换。"""
-    monkeypatch.setenv(checkin.Config.ENV_COOKIES, BOTH_SITES_COOKIE)
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
     monkeypatch.delenv(checkin.Config.ENV_EXCHANGE_PLAN, raising=False)
     _stub_api["points"] = 500
 
@@ -528,7 +531,7 @@ def test_exchange_success_is_logged_even_when_verbose_is_off(monkeypatch, caplog
     回归的就是"积分够了、兑换也成功了, 但日志里一个字都没有"这个观测盲区。
     这里必须打真 API.exchange: 把 API 层 stub 掉就等于在测 stub 自己。
     """
-    api = checkin.API("glados.cloud", 1)
+    api = checkin.API(1)
     monkeypatch.setattr(
         checkin.API,
         "_make_request",
@@ -536,7 +539,7 @@ def test_exchange_success_is_logged_even_when_verbose_is_off(monkeypatch, caplog
     )
 
     with caplog.at_level("INFO"):
-        assert api.exchange(BOTH_SITES_COOKIE, "plan500") == "兑换成功: plan500"
+        assert api.exchange(GLADOS_COOKIE, "plan500") == "兑换成功: plan500"
 
     assert any("兑换成功" in record.getMessage() for record in caplog.records), caplog.text
 
@@ -546,7 +549,7 @@ def test_exchange_failure_does_not_fail_the_run(monkeypatch, _stub_api):
 
     否则"积分不够"这类正常状态会天天把 Actions 染红, 把真正的签到失败淹没。
     """
-    monkeypatch.setenv(checkin.Config.ENV_COOKIES, BOTH_SITES_COOKIE)
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
     _stub_api["exchange_result"] = "兑换失败: 服务端炸了"
 
     assert checkin.main() == checkin.EXIT_OK
@@ -554,7 +557,7 @@ def test_exchange_failure_does_not_fail_the_run(monkeypatch, _stub_api):
 
 def test_exchange_requests_use_the_configured_plan(monkeypatch, _stub_api):
     """需求: GLADOS_EXCHANGE_PLAN 要真的传下去, 不是永远发默认计划。"""
-    monkeypatch.setenv(checkin.Config.ENV_COOKIES, BOTH_SITES_COOKIE)
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
     monkeypatch.setenv(checkin.Config.ENV_EXCHANGE_PLAN, "plan100")
     _stub_api["points"] = 100
 
@@ -566,14 +569,14 @@ def test_exchange_requests_use_the_configured_plan(monkeypatch, _stub_api):
 
 def test_api_checkin_reports_failure_when_request_raises(monkeypatch):
     """失败模式: 网络异常被 log_method 兜底后必须仍是「签到失败」而不是成功。"""
-    api = checkin.API("glados.cloud", 1)
+    api = checkin.API(1)
 
     def boom(*args, **kwargs):
         raise checkin.requests.exceptions.ConnectionError("boom")
 
     monkeypatch.setattr(api.session, "post", boom)
 
-    result = api.checkin(BOTH_SITES_COOKIE)
+    result = api.checkin(GLADOS_COOKIE)
 
     assert result["status"] == "签到失败"
     assert result["points"] == "0"
@@ -617,7 +620,7 @@ def test_api_checkin_hints_user_agent_when_automation_detected(monkeypatch, capl
     )
 
     with caplog.at_level("ERROR"):
-        result = api.checkin(BOTH_SITES_COOKIE)
+        result = api.checkin(GLADOS_COOKIE)
 
     assert result["status"] == "签到失败"
     assert "GLADOS_USER_AGENT" in caplog.text
@@ -630,7 +633,7 @@ def test_api_checkin_hints_user_agent_when_automation_detected(monkeypatch, capl
 
 def test_api_checkin_automation_hint_still_works_without_device_fields(monkeypatch, caplog):
     """失败模式: 服务端只回 code 4 不带 reason/设备字段时, 提示不能崩也不能消失。"""
-    api = checkin.API("glados.cloud", 1)
+    api = checkin.API(1)
     monkeypatch.setattr(
         api,
         "_make_request",
@@ -638,7 +641,7 @@ def test_api_checkin_automation_hint_still_works_without_device_fields(monkeypat
     )
 
     with caplog.at_level("ERROR"):
-        result = api.checkin(BOTH_SITES_COOKIE)
+        result = api.checkin(GLADOS_COOKIE)
 
     assert result["status"] == "签到失败"
     assert "签到被判定为自动签到" in caplog.text
@@ -667,22 +670,22 @@ def _run_checkin(env_overrides: dict) -> subprocess.CompletedProcess:
 
 
 def test_e2e_invalid_cookie_against_live_api_exits_nonzero_with_actionable_log():
-    """端到端: 拿一份无效 Cookie 打真实接口, 必须失败并点名该域名需要的会话字段。
+    """端到端: 拿一份无效 Cookie 打真实接口, 必须失败并点名需要的会话字段。
 
     Cookie 值是可识别的哨兵值而不是真实凭据, 所以这条用例验证的是诊断链路
     (真实网络 + 真实子进程 + 服务端确实返回 code -2 → 退出码 1 + 可操作提示),
     而不是服务端对字段的要求 —— 后者只能靠真实账号的 Cookie 验证。
     对应线上故障: glados.cloud 全接口返回 code -2「没有权限」时 Actions 必须变红。
     """
-    proc = _run_checkin({checkin.Config.ENV_COOKIES: RAILGUN_SITE_COOKIE})
+    proc = _run_checkin({checkin.Config.ENV_COOKIES: GLADOS_COOKIE})
 
     combined = proc.stdout + proc.stderr
     assert proc.returncode == checkin.EXIT_CHECKIN_FAILED, combined
     assert "认证失败" in proc.stderr
     assert "没有权限" in proc.stderr
-    # 针对上游反馈: glados.cloud 的失败提示要指名 gld:sess/gld:sess.sig
+    # 失败提示要指名这个站点需要的会话字段
     assert "gld:sess" in combined
-    assert "在所有域名上都未签到成功" in proc.stderr
+    assert "签到失败" in proc.stderr
     assert COOKIE_SENTINEL not in combined
 
 

@@ -22,7 +22,7 @@ on:
 
 jobs:
   build:
-    name: glados/railgun checkin
+    name: glados checkin
     runs-on: ubuntu-latest
       
     permissions:
