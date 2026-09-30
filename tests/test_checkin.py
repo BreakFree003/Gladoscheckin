@@ -288,7 +288,6 @@ def test_api_get_requests_carry_no_content_type_or_referer(monkeypatch):
 def _config_with_cookie(monkeypatch, cookie: str, user_agent=None) -> checkin.Config:
     """在干净的环境里加载配置: 可选环境变量一律先清掉, 免得被本机环境干扰断言。"""
     monkeypatch.setenv(checkin.Config.ENV_COOKIES, cookie)
-    monkeypatch.delenv(checkin.Config.ENV_VERBOSE, raising=False)
     if user_agent is None:
         monkeypatch.delenv(checkin.Config.ENV_USER_AGENT, raising=False)
     else:
@@ -299,7 +298,7 @@ def _config_with_cookie(monkeypatch, cookie: str, user_agent=None) -> checkin.Co
 def _assert_no_config_warning(caplog, cookie: str) -> None:
     """正常配置在加载期一条告警都不该有, 而且任何级别的日志都不得出现 Cookie 值。
 
-    不设可选的 GLADOS_EXCHANGE_PLAN / GLADOS_VERBOSE 是最常见的正常状态,
+    只设必需的 GLADOS_COOKIES 是最常见的正常状态,
     让正常路径冒 ⚠️ 会训练人忽略警告, 真正的异常反而看不见。
     """
     warnings = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
@@ -375,7 +374,6 @@ class _FakeConfig:
 
     def __init__(self, cookie_count: int):
         self.cookies_list = [f"cookie-{i}" for i in range(cookie_count)]
-        self.verbose = False
         self.EXCHANGE_PLAN = checkin.Config.EXCHANGE_PLAN
         self.EXCHANGE_PLAN_POINTS = checkin.Config.EXCHANGE_PLAN_POINTS
 
@@ -498,30 +496,12 @@ def test_result_line_reports_the_points_earned_by_this_checkin(monkeypatch, _stu
     assert "获得 13 积分" in caplog.text
 
 
-def test_verbose_logs_the_wire_traffic_without_leaking_the_cookie(monkeypatch, caplog):
-    """需求: 详细日志要能看到线上流量 (方法 / 路径 / 状态码 / 响应体)。
+def test_a_successful_checkin_logs_neither_the_request_nor_the_cookie(monkeypatch, caplog):
+    """需求: 日志要短, 且不泄密。
 
-    这是详细日志存在的全部意义 —— 排查服务端到底回了什么。同时也是一条安全约束:
-    请求头从不进日志, 所以 Cookie 值不得出现在任何一条详细日志里。
+    不逐条回显请求/响应, 是用户明确提过的要求 (旧日志跑一次 18 行); Cookie 值不落盘
+    是安全约束 —— 请求头从不进日志, 这两条都得有人守着。
     """
-    api = checkin.API(1, verbose=True)
-
-    with caplog.at_level("INFO"):
-        _capture_request(
-            monkeypatch,
-            {"code": 1, "message": "Today's observation logged."},
-            lambda: api.checkin(GLADOS_COOKIE),
-        )
-
-    logged = caplog.text
-    assert "POST" in logged and "/api/user/checkin" in logged, logged
-    assert "Today's observation logged." in logged, logged
-    assert GLADOS_COOKIE not in logged
-    assert COOKIE_SENTINEL not in logged
-
-
-def test_wire_traffic_is_not_logged_when_verbose_is_off(monkeypatch, caplog):
-    """需求: 详细日志关着的时候, 线上流量不该出现在日志里 (默认日志要短)。"""
     api = checkin.API(1)
 
     with caplog.at_level("INFO"):
@@ -531,7 +511,9 @@ def test_wire_traffic_is_not_logged_when_verbose_is_off(monkeypatch, caplog):
             lambda: api.checkin(GLADOS_COOKIE),
         )
 
-    assert "/api/user/checkin" not in caplog.text, caplog.text
+    assert "Today's observation logged." not in caplog.text, caplog.text
+    assert GLADOS_COOKIE not in caplog.text
+    assert COOKIE_SENTINEL not in caplog.text
 
 
 # --------------------------------------------------------------------------
@@ -562,10 +544,11 @@ def test_exchange_request_is_sent_once_points_reach_the_threshold(monkeypatch, _
     assert set(_stub_api["exchange_calls"]) == {"plan500"}
 
 
-def test_exchange_success_is_logged_even_when_verbose_is_off(monkeypatch, caplog):
+def test_exchange_success_is_always_logged(monkeypatch, caplog):
     """需求: 兑换成功必须留痕。
 
-    它是一次扣掉几百积分、改变账号状态的操作, 而默认配置没开 verbose。
+    它是一次扣掉几百积分、改变账号状态的操作, 所以必须无条件留痕 ——
+    否则成功兑换这种最该知道的事, 反而在日志里什么都看不到。
     回归的就是"积分够了、兑换也成功了, 但日志里一个字都没有"这个观测盲区。
     这里必须打真 API.exchange: 把 API 层 stub 掉就等于在测 stub 自己。
     """
@@ -637,7 +620,6 @@ def test_api_checkin_hints_user_agent_when_automation_detected(monkeypatch, capl
     loginDevice / currentDevice; 脚本也要把这两个值打出来, 否则用户只能瞎试 UA。
     """
     api = checkin.API(
-        "glados.cloud",
         1,
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",

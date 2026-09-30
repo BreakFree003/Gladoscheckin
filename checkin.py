@@ -26,9 +26,6 @@ class LogEmoji:
     SUCCESS = "✅"
     REPEAT = "🔄"
     FAIL = "❌"
-    WARNING = "⚠️"
-    SEND = "→"
-    RECV = "←"
 
 
 """唯一的站点。
@@ -128,7 +125,6 @@ class Config:
     """应用配置"""
 
     ENV_COOKIES = "GLADOS_COOKIES"
-    ENV_VERBOSE = "GLADOS_VERBOSE"
     ENV_USER_AGENT = "GLADOS_USER_AGENT"
 
     """默认 User-Agent。
@@ -140,9 +136,6 @@ GLaDOS 的反自动化校验会比对「签到请求的平台」与「登录时�
 你自己浏览器的 navigator.userAgent 才是最稳的做法。"""
     DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
 
-    """默认是否输出详细日志"""
-    DEFAULT_VERBOSE = False
-
     """兑换计划与它需要的积分。
 
 只有 plan500 一个: 服务端自己回过 "Need 500", 是唯一验证过的门槛。
@@ -153,14 +146,12 @@ plan100 / plan200 来自站点说明但从未在真实接口上验证过, 而 GL
 
     def __init__(self):
         self.cookies_list: List[str] = []
-        self.verbose: bool = self.DEFAULT_VERBOSE
         self.user_agent: str = self.DEFAULT_USER_AGENT
         self._load_config()
 
     def _load_config(self) -> None:
         """加载配置, 并把生效的配置打成启动日志 (一行, 便于事后对照)。"""
         raw_cookies_env: Optional[str] = os.environ.get(self.ENV_COOKIES)
-        verbose_env: Optional[str] = os.environ.get(self.ENV_VERBOSE)
         user_agent_env: Optional[str] = os.environ.get(self.ENV_USER_AGENT)
 
         if raw_cookies_env:
@@ -168,22 +159,9 @@ plan100 / plan200 来自站点说明但从未在真实接口上验证过, 而 GL
             if not self.cookies_list:
                 raise ValueError(f"环境变量 '{self.ENV_COOKIES}' 已设置, 但未包含任何有效的 Cookie。")
 
-        if verbose_env is not None:
-            verbose_env_lower = verbose_env.lower()
-            if verbose_env_lower in ["true", "1", "yes", "y"]:
-                self.verbose = True
-            elif verbose_env_lower in ["false", "0", "no", "n"]:
-                self.verbose = False
-            else:
-                logger.warning(
-                    f"环境变量 '{self.ENV_VERBOSE}' 的值 '{verbose_env}' 无效, "
-                    f"按 {self.DEFAULT_VERBOSE} 处理。"
-                )
-
         logger.info(
             f"开始签到: {len(self.cookies_list)} 个账号, "
-            f"兑换 {self.EXCHANGE_PLAN} (需 {self.EXCHANGE_PLAN_POINTS} 积分), "
-            f"详细日志 {'开' if self.verbose else '关'}"
+            f"兑换 {self.EXCHANGE_PLAN} (需 {self.EXCHANGE_PLAN_POINTS} 积分)"
         )
 
         if user_agent_env and user_agent_env.strip():
@@ -197,13 +175,11 @@ plan100 / plan200 来自站点说明但从未在真实接口上验证过, 而 GL
     def _validate_cookies(self) -> None:
         """校验 Cookie 结构, 只输出字段名与数量, 不输出凭据本身。
 
-        字段齐全属于正常情况, 只写详细日志; 缺字段才是要看的那条。
+        只报问题: 字段齐全属于正常情况, 不值得在正常路径上空占一行。
         """
         for idx, cookie in enumerate(self.cookies_list, 1):
             missing = missing_cookie_keys(cookie)
             if not missing:
-                if self.verbose:
-                    logger.info(f"[{idx}] Cookie 会话字段完整 ({len(parse_cookie_keys(cookie))} 项)")
                 continue
 
             present = parse_cookie_keys(cookie)
@@ -229,11 +205,9 @@ class API:
     def __init__(
         self,
         cookie_index: int = 0,
-        verbose: bool = False,
         user_agent: str = Config.DEFAULT_USER_AGENT,
     ):
         self.cookie_index: int = cookie_index
-        self.verbose: bool = verbose
         self.user_agent: str = user_agent
         self.headers: Dict[str, str] = self._get_headers()
         self._auth_error_reported: bool = False
@@ -278,14 +252,12 @@ class API:
             "user-agent": self.user_agent,
         }
 
-    def _log(self, level: str, message: str, force: bool = False) -> None:
-        """统一日志输出方法。
+    def _log(self, level: str, message: str) -> None:
+        """统一的 API 层日志 (行首 `[N]` 是账号序号)。
 
-        行首的 `[N]` 是账号序号 (多个账号时才分得清), 详细日志以外的行平时不出现。
+        这里只输出有信息量的事件: 失败、以及会改变账号状态的动作 (兑换成功)。
+        成功的请求不再逐条回显 —— 每个账号跑完会有一行结果。
         """
-        if not (force or self.verbose):
-            return
-
         log_message = f"[{self.cookie_index}] {message}"
         if level == "info":
             logger.info(log_message)
@@ -306,7 +278,6 @@ class API:
         self._log(
             "error",
             f"{endpoint} 认证失败 (code -2, message: {message}): Cookie 无效、已过期或不完整",
-            force=True,
         )
 
     def _report_automation_block(self, payload: Dict) -> None:
@@ -333,7 +304,6 @@ class API:
             f"只有 User-Agent (当前 [{self.user_agent}])。请在登录那个浏览器的控制台执行 "
             f"navigator.userAgent, 把完整值设为 {Config.ENV_USER_AGENT} "
             "(Windows / Linux / iPhone 的 UA 实测都会被拦下)",
-            force=True,
         )
 
     def _serialize_post_body(self, data: Optional[Dict]) -> bytes:
@@ -351,9 +321,8 @@ class API:
         请求体是紧凑 JSON, content-type 为 `application/json;charset=UTF-8`。
         GET 请求则**不带** content-type —— 浏览器的 GET 也不带。
 
-        线上流量只在这里记一次 (详细日志): 请求记方法/路径/请求体, 响应记状态码与
-        响应体。各接口方法因此不用再各自回显一遍原始 JSON。Cookie 不在记录范围内
-        —— 请求头从不进日志。
+        只有失败才记日志: 网络错误与非 2xx 都会带出原始响应。成功的请求一条不记 ——
+        每个账号结束后有一行结果, 而请求头从不进日志 (Cookie 值不落盘)。
         """
         path = url.removeprefix(f"https://{DOMAIN}")
         body = self._serialize_post_body(data).decode("utf-8") if data else ""
@@ -363,22 +332,19 @@ class API:
         try:
             if method.upper() == "POST":
                 session_headers["content-type"] = self.CONTENT_TYPE_JSON
-                self._log("info", f"{LogEmoji.SEND} POST {path} {body}")
                 response = self.session.post(url, headers=session_headers, data=body.encode("utf-8"), timeout=(60, 120))
             elif method.upper() == "GET":
-                self._log("info", f"{LogEmoji.SEND} GET {path}")
                 response = self.session.get(url, headers=session_headers, timeout=(60, 120))
             else:
-                self._log("error", f"不支持的 HTTP 方法: {method}", force=True)
+                self._log("error", f"不支持的 HTTP 方法: {method}")
                 return None
 
-            self._log("info", f"{LogEmoji.RECV} {response.status_code} {response.text}")
             if not response.ok:
-                self._log("warning", f"请求 {path} 失败: HTTP {response.status_code}, 响应内容: {response.text}", force=True)
+                self._log("warning", f"请求 {path} 失败: HTTP {response.status_code}, 响应内容: {response.text}")
                 return None
             return response
         except requests.exceptions.RequestException as e:
-            self._log("error", f"请求 {path} 时发生网络错误: {e}", force=True)
+            self._log("error", f"请求 {path} 时发生网络错误: {e}")
             return None
 
     def _get_checkin_data(self) -> Dict[str, str]:
@@ -423,7 +389,9 @@ class API:
                 elif is_automation_blocked(code, message):
                     self._report_automation_block(data)
                 else:
-                    self._log("error", f"签到失败: code {code}, message: {message}", force=True)
+                    # 已知原因各有专门的一行解释; 剩下的只有原始响应能说明问题
+                    # (服务端加字段时, 这里就能看见)。
+                    self._log("error", f"签到失败: {response.text}")
                 result["code"] = CheckinStatus.FAILURE
                 result["status"] = "签到失败"
                 result["points"] = "0"
@@ -454,7 +422,7 @@ class API:
             if is_permission_error(code, message):
                 self._report_auth_error("status", message)
             else:
-                self._log("warning", f"读取剩余天数失败: code {code}, message: {message}", force=True)
+                self._log("warning", f"读取剩余天数失败: {response.text}")
             return "None 天", code
 
         return "None 天", -2
@@ -478,7 +446,7 @@ class API:
             if is_permission_error(code, message):
                 self._report_auth_error("points", message)
             else:
-                self._log("warning", f"读取总积分失败: code {code}, message: {message}", force=True)
+                self._log("warning", f"读取总积分失败: {response.text}")
             return "None 积分", 0
 
         return "None 积分", 0
@@ -501,10 +469,10 @@ class API:
             if code == CheckinStatus.SUCCESS.value:
                 # 兑换会真扣掉几百积分, 是"改变账号状态"的操作, 不管有没有开详细日志
                 # 都必须留痕 —— 否则成功时反而在日志里什么都看不到。
-                self._log("info", f"兑换成功: {plan} (code {code}, message: {message})", force=True)
+                self._log("info", f"兑换成功: {plan} (code {code}, message: {message})")
                 return f"兑换成功: {plan}"
 
-            self._log("error", f"兑换失败: {plan} (code {code}, message: {message})", force=True)
+            self._log("error", f"兑换失败: {plan} (code {code}, message: {message})")
             if is_permission_error(code, message):
                 self._report_auth_error("exchange", message)
             return f"兑换失败: {message}"
@@ -535,14 +503,8 @@ class Checker:
         self.config = config
         self.results: List[CheckinResult] = []
 
-    def _log(self, cookie_idx: int, message: str, level: str = "info", verbose_only: bool = False) -> None:
-        """统一的账号级日志。
-
-        结果行一定要输出 (不能被详细日志开关藏起来), 过程性细节走 verbose_only。
-        """
-        if verbose_only and not self.config.verbose:
-            return
-
+    def _log(self, cookie_idx: int, message: str, level: str = "info") -> None:
+        """统一的账号级日志 (一行一个账号的结果)。"""
         log_message = f"[{cookie_idx}] {message}"
         if level == "warning":
             logger.warning(log_message)
@@ -578,7 +540,7 @@ class Checker:
         """一个账号的完整流程: 查状态 -> 签到 -> 查积分 -> 达标才兑换。"""
         result = CheckinResult(cookie_idx)
 
-        with API(cookie_idx, verbose=self.config.verbose, user_agent=self.config.user_agent) as api:
+        with API(cookie_idx, user_agent=self.config.user_agent) as api:
             # 1. 剩余天数 (只进详细日志的结果行, 默认日志里靠签到结果说话)
             result.days, _ = api.get_status(cookie)
 
@@ -597,11 +559,6 @@ class Checker:
             required_points = self.config.EXCHANGE_PLAN_POINTS
             if points_num < required_points:
                 result.exchange = f"未兑换 (积分 {points_num}/{required_points})"
-                self._log(
-                    cookie_idx,
-                    f"积分 {points_num}/{required_points}, 未到 {self.config.EXCHANGE_PLAN} 门槛, 跳过兑换",
-                    verbose_only=True,
-                )
             else:
                 result.exchange = api.exchange(cookie, self.config.EXCHANGE_PLAN)
 
