@@ -104,21 +104,10 @@ jobs:
         # GLaDOS 会校验签到请求的平台是否与登录浏览器一致, 平台不符会被判定为自动签到 (code 4)
         GLADOS_USER_AGENT: ${{ secrets.GLADOS_USER_AGENT }}
 
-    # 签到失败时, 这两个收尾步骤也要照跑:
-    # 用 if: always() 保证 keepalive 不会因为签到红了就被跳过, 否则工作流可能被
-    # GitHub 判定为长期不活动而自动停用。作业本身仍会因为上面步骤失败而保持红色。
+    # 签到失败时这一步也要照跑: 用 if: always() 保证 keepalive 不会因为签到红了就被
+    # 跳过, 否则工作流可能被 GitHub 判定为长期不活动而自动停用。作业本身仍会因为上面
+    # 步骤失败而保持红色。
+    # (需要 permissions.actions: write —— 它是靠 API 把工作流重新启用的。)
     - name: Keep alive
       if: always()
-      uses: liskin/gh-workflow-keepalive@v1 
-        
-    - name: Delete workflow runs
-      if: always()
-      uses: Mattraks/delete-workflow-runs@v2
-      with:
-        token: ${{ github.token }}
-        repository: ${{ github.repository }}
-        # 保留更长的历史: schedule 漂移需要连续多天的触发时间才能看出来,
-        # 原来 7 天会把排查漂移最需要的记录删掉。
-        retain_days: 30
-        keep_minimum_runs: 30
-        delete_run_by_conclusion_pattern: success
+      uses: liskin/gh-workflow-keepalive@v1

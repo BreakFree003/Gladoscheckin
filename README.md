@@ -31,9 +31,8 @@
 - **手动触发（Actions 页面点 Run workflow）不跳过**，方便排查问题时立刻跑一次。
 - 查询运行记录失败时一律**回退为照常签到** —— 宁可多签一次，也不会静默漏签。
 
-另外工作流还有两个收尾步骤：`liskin/gh-workflow-keepalive` 防止 GitHub 因长期不活动
-自动停用定时任务；`Mattraks/delete-workflow-runs` 保留 30 天运行记录（排查漂移要看
-连续多天的实际触发时间，删太早会失去证据）。
+另外还有一个收尾步骤：`liskin/gh-workflow-keepalive` 防止 GitHub 因长期不活动自动停用
+定时任务（它靠 API 重新启用工作流，所以 workflow 里要 `permissions: actions: write`）。
 
 ## 配置
 
