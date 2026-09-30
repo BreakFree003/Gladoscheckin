@@ -33,21 +33,40 @@ printf '%s\\n' "${STUB_GH_COUNT:-0}"
 """
 
 
+def _workflow() -> dict:
+    with open(WORKFLOW_PATH, encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+def _triggers() -> dict:
+    """workflow 的 on: 段。
+
+    注意 YAML 1.1 把裸写的 `on:` 当成布尔真, 所以 PyYAML 给出的键是 True 而不是 "on"。
+    """
+    workflow = _workflow()
+    return workflow.get("on") or workflow[True]
+
+
+def _steps() -> list:
+    """workflow 的全部步骤。不写死作业名 (它被改过名), 但要求只有一个作业。"""
+    jobs = _workflow()["jobs"]
+    assert len(jobs) == 1, f"workflow 应当只有一个作业, 实际有 {list(jobs)}"
+    (job,) = jobs.values()
+    return job["steps"]
+
+
+def _gate_step() -> dict:
+    steps = [s for s in _steps() if s.get("id") == "today"]
+    assert len(steps) == 1, f"workflow 里应当有且只有一个 id: today 的步骤, 实际 {len(steps)} 个"
+    return steps[0]
+
+
 def _gate_script() -> str:
     """从 workflow 里取出 gate 那一步要执行的 shell。
 
     从 YAML 现取而不是抄一份: 抄一份的话, 改了 workflow 而忘了改测试, 测试仍会绿。
     """
-    with open(WORKFLOW_PATH, encoding="utf-8") as handle:
-        workflow = yaml.safe_load(handle)
-
-    # 不写死作业名 (它被改过名), 但要求只有一个作业 —— 否则下面取 steps 就没意义了。
-    jobs = workflow["jobs"]
-    assert len(jobs) == 1, f"workflow 应当只有一个作业, 实际有 {list(jobs)}"
-    (job,) = jobs.values()
-    steps = [s for s in job["steps"] if s.get("id") == "today"]
-    assert len(steps) == 1, f"workflow 里应当有且只有一个 id: today 的步骤, 实际 {len(steps)} 个"
-    return steps[0]["run"]
+    return _gate_step()["run"]
 
 
 def _run_gate(tmp_path, *, event: str = "schedule", count: str = "0", fail: bool = False):
@@ -189,3 +208,48 @@ def test_gate_queries_run_history_with_an_explicit_get(tmp_path):
 
     assert "-X GET" in calls, f"gh 调用里缺少显式的 -X GET: {calls!r}"
     assert "actions/workflows/gladosCheck.yml/runs" in calls, f"查询的接口不对: {calls!r}"
+
+
+# --------------------------------------------------------------------------
+# workflow 的接线: 这些改动不会让上面任何一条 gate 测试变红
+# --------------------------------------------------------------------------
+
+
+def test_workflow_keeps_several_schedule_slots_as_fallbacks():
+    """失败模式: 计划任务被删掉, 或只剩一个槽位。
+
+    GitHub 的 schedule 是 best-effort: 本仓库实测计划时间点会迟到 3~10 小时, 还会整段
+    丢弃。只留一个槽位时, 一次漂移就是整天漏签 —— 而漏签没有任何日志、没有任何邮件。
+    """
+    schedule = _triggers()["schedule"]
+    crons = [entry["cron"] for entry in schedule]
+
+    assert len(crons) >= 2, f"至少要留一个兜底槽位, 实际只有 {crons}"
+    for cron in crons:
+        assert len(cron.split()) == 5, f"cron 应当是 5 个字段 (分 时 日 月 周): {cron!r}"
+
+
+def test_the_gate_step_gets_a_token():
+    """失败模式: gate 少了 GH_TOKEN。
+
+    gate 用 gh api 查今天的成功运行; 没有 token 时 gh 会失败, 脚本回退成"照常签到"
+    (带 ::warning::)。生产里 4 个槽位于是各签一次 —— 不致命, 但闸门等于没有。
+    测试里看不见, 因为这里的测试自己造 env、直接把那段 shell 跑起来。
+    """
+    env = _gate_step().get("env") or {}
+
+    assert "GH_TOKEN" in env, f"gate 需要 GH_TOKEN 才能查运行记录, 实际 env: {list(env)}"
+
+
+def test_the_checkin_step_only_runs_when_the_gate_did_not_skip():
+    """失败模式: 跑签到那一步的 if 被删掉, 或者方向写反。
+
+    写反 (把 != 写成 ==) 的结果是"只有今天已经签过才签到": 整天不签到, 而作业是绿的 ——
+    没有日志、没有邮件、没有测试会响。这正是本仓库最怕的那种静默漏签。
+    """
+    runners = [s for s in _steps() if "checkin.py" in (s.get("run") or "")]
+
+    assert len(runners) == 1, f"应当只有一步跑 checkin.py, 实际 {len(runners)} 步"
+    condition = runners[0].get("if", "")
+    assert "steps.today.outputs.skip" in condition, f"跑签到的步骤没有被闸门控制: {condition!r}"
+    assert "!=" in condition, f"条件方向应当是「闸门没跳过才跑」: {condition!r}"
