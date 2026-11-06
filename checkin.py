@@ -3,12 +3,14 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 
 import requests
 
+import site_protocol
 from logging_config import init_logger
 
 
@@ -286,6 +288,10 @@ class API:
     POINTS_URL = "/api/user/points"
     EXCHANGE_URL = "/api/user/exchange"
     CHALLENGE_URL = "/api/user/checkin/challenge"
+    PAGE_PATH = "/console/checkin"
+
+    """抓 JS 的并发数: 32 个 chunk 串行要 20 秒, 8 线程 2~3 秒 (2026-11-07 实测)。"""
+    SCRIPT_WORKERS = 8
 
     """POST 的 content-type, 与站点前端 axios 发出的一致 (带 charset, 无空格)。"""
     CONTENT_TYPE_JSON = "application/json;charset=UTF-8"
@@ -447,6 +453,57 @@ class API:
             self._log("error", f"请求 {path} 时发生网络错误: {e}")
             return None
 
+    def _protocol_drift(self) -> List[str]:
+        """签到**之前**先比一次前端协议, 返回差异说明 (空列表表示一成不变)。
+
+        为什么要提前: 2026-11-05 站点给签到加了 nonce/proof, 接口照样回 code 0, 只是
+        把分数降成 1 分。等到响应回来才发现, 分已经丢了 —— 而且是丢了两天才被注意到。
+        协议本身是公开的, 签到页面加载的 bundle 里就有完整实现, 所以在提交签到**之前**
+        先抓一次页面与 JS 比对, 变了就停下。
+
+        为什么不会因为发版误报: 两份相隔一天、32 个 chunk 的构建 hash 全不同、模块编号
+        也从 613 变成 614, 但抽出的六个字段逐字相同 (见 site_protocol 的模块说明)。
+
+        取不到页面时只警告并放行 —— 「这次没抓到」不等于「协议变了」, 为此拦下签到
+        等于让一次网络抖动吃掉一天的分。但页面 200 却抽不出协议, 算变了。
+        """
+        page_url = self._get_full_url(self.PAGE_PATH)
+        response = self._make_request(page_url, "GET")
+        if not response:
+            self._log("warning", "没取到签到页面, 跳过协议比对 (这不代表协议变了)")
+            return []
+
+        srcs = site_protocol.parse_script_srcs(response.text)
+        if not srcs:
+            self._log("error", "签到页面里一个 JS 都没解析到, 页面结构可能变了")
+            return ["签到页面里没有解析到任何 JS 脚本"]
+
+        sources = self._fetch_scripts(srcs)
+        if not sources:
+            self._log("warning", "签到页面的 JS 一个都没抓到, 跳过协议比对")
+            return []
+
+        return site_protocol.drift(site_protocol.EXPECTED, site_protocol.fingerprint(sources))
+
+    def _fetch_scripts(self, srcs: List[str]) -> Dict[str, str]:
+        """并发抓 JS 源码, 返回「路径 -> 源码」。抓不到的直接跳过。
+
+        单个 chunk 抓失败不算变化: 协议跨两个 chunk, 缺一个只会让对应字段抽空, 而
+        抽空本身会被 drift 报成「变了」—— 那是一条假警报。所以这里把抓不到的路径数
+        出来, 由调用方在日志里看见。
+        """
+        def fetch(src: str) -> Tuple[str, Optional[str]]:
+            response = self._make_request(self._get_full_url(src), "GET")
+            return src, (response.text if response else None)
+
+        with ThreadPoolExecutor(max_workers=self.SCRIPT_WORKERS) as pool:
+            results = list(pool.map(fetch, srcs))
+
+        sources = {src: text for src, text in results if text is not None}
+        if len(sources) != len(srcs):
+            self._log("warning", f"有 {len(srcs) - len(sources)} 个 JS 没抓到, 协议比对可能不完整")
+        return sources
+
     def _fetch_challenge(self, cookies: str) -> Optional[Dict]:
         """取一次「观察挑战」的 nonce。拿不到就返回 None, 由调用方决定拦下签到。
 
@@ -509,7 +566,10 @@ class API:
         失败时宁可判成签到失败、让当天的下一个 cron 槽重试, 也不要记一笔假成功。
 
         同理, code 0 但分数低于 MIN_EXPECTED_POINTS 也判失败 (DEGRADED): 分数是脚本
-        唯一能看见的「这次签到到底算不算数」的证据。"""
+        唯一能看见的「这次签到到底算不算数」的证据。
+
+        第一步是协议比对, 它发生在提交签到**之前** —— 站点改了签到规则时, 抢在丢分
+        之前停下, 而不是签完再从分数上倒推。"""
         url = self._get_full_url(self.CHECKIN_URL)
 
         result = {
@@ -518,6 +578,15 @@ class API:
             "code": CheckinStatus.FAILURE,
             "reason": "",
         }
+
+        drift = self._protocol_drift()
+        if drift:
+            self._log("error", "站点签到协议变了, 已暂停签到 (没有提交, 今天的分数未动):")
+            for problem in drift:
+                self._log("error", f"  - {problem}")
+            result["status"] = "站点签到协议变了, 已暂停签到"
+            result["reason"] = "protocol"
+            return result
 
         challenge = self._fetch_challenge(cookies)
         if not challenge:
@@ -694,6 +763,11 @@ def run_checkin(config: Config) -> CheckinResult:
         result.points = checkin_result.get("points", "0")
         result.reason = checkin_result.get("reason", "")
 
+        # 协议对不上时签到根本没提交, 后面的余额查询与兑换都不该继续: 用户要的是
+        # 「有变化就先停下」, 停下来的意思就是不碰账户。
+        if result.reason == "protocol":
+            return result
+
         # 2. 总积分
         points_str, points_num = api.get_points(config.cookie)
         result.points_total = points_str
@@ -724,6 +798,11 @@ logger = init_logger()
 
 """按失败原因给出下一步。每一种都指向一个具体动作, 不含「请重试」这种废话。"""
 NEXT_STEPS: Dict[str, str] = {
+    "protocol": (
+        "前端签到协议变了, 脚本在提交签到之前就停了 (今天的分没动)。"
+        "上面几行 ERROR 逐条写明哪个字段从什么变成了什么; "
+        "改 site_protocol.EXPECTED 与 checkin.py 的对应实现, 并抓一次网页端签到请求复核"
+    ),
     "contract": (
         "站点接口的响应形状变了, 脚本已停机 (没有继续猜着签)。"
         "上一条 ERROR 里有完整原始响应, 照着它改 CONTRACTS 与解析逻辑再打开工作流"

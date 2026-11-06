@@ -18,6 +18,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import checkin  # noqa: E402  (需要先注入仓库根目录到 sys.path)
+import site_protocol  # noqa: E402  (同上)
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COOKIE_SENTINEL = "SENTINEL_VALUE_MUST_NOT_BE_LOGGED"
@@ -211,7 +212,7 @@ def _capture_request(monkeypatch, payload: dict, call, challenge_payload=None) -
     return server.recorded
 
 
-def test_checkin_wire_request_matches_the_captured_browser_request(monkeypatch):
+def test_checkin_wire_request_matches_the_captured_browser_request(_no_protocol_drift, monkeypatch):
     """失败模式: 请求体 / content-type / accept / origin / UA 与网页点签到时不一致。
 
     期望值逐项来自浏览器抓包 (tests/fixtures/browser_checkin_request.json):
@@ -295,7 +296,7 @@ def test_api_get_requests_carry_no_content_type_or_referer(monkeypatch):
     assert request["headers"]["cookie"] == GLADOS_COOKIE
 
 
-def test_checkin_challenge_request_matches_the_captured_browser_request(monkeypatch):
+def test_checkin_challenge_request_matches_the_captured_browser_request(_no_protocol_drift, monkeypatch):
     """失败模式: 取挑战这一步的请求形态与浏览器不一致 (或者干脆没发)。
 
     期望值来自同一次抓包: GET /api/user/checkin/challenge, 只带 accept / UA /
@@ -333,7 +334,7 @@ def test_proof_is_the_hash_the_browser_actually_sent():
         assert api._compute_proof(pair["nonce"]) == pair["proof"], pair["nonce"]
 
 
-def test_checkin_waits_out_the_challenge_window_before_posting(monkeypatch):
+def test_checkin_waits_out_the_challenge_window_before_posting(_no_protocol_drift, monkeypatch):
     """失败模式: 拿到 nonce 立刻提交。
 
     站点前端拿到 nonce 后强制停顿 2500ms 才 POST (bundle main~189dec1b 里写死的
@@ -352,7 +353,7 @@ def test_checkin_waits_out_the_challenge_window_before_posting(monkeypatch):
     assert sleeps == [2.5], "拿到 nonce 后必须停顿前端要求的 2500ms 再提交"
 
 
-def test_checkin_fails_closed_when_the_challenge_is_unavailable(monkeypatch, caplog):
+def test_checkin_fails_closed_when_the_challenge_is_unavailable(_no_protocol_drift, monkeypatch, caplog):
     """需求: 拿不到 nonce 就不要发签到请求。
 
     不取挑战也能 POST「成功」(code 0), 但服务端只给 1 分, 工作流看不出异常 ——
@@ -376,7 +377,7 @@ def test_checkin_fails_closed_when_the_challenge_is_unavailable(monkeypatch, cap
     assert "签到挑战" in caplog.text
 
 
-def test_checkin_marks_a_one_point_result_as_degraded(monkeypatch):
+def test_checkin_marks_a_one_point_result_as_degraded(_no_protocol_drift, monkeypatch):
     """需求: code 0 但只拿到 1 分必须判成降级, 不能记成功。
 
     2026-11-05 与 11-06 的线上日志都是「✅ 签到成功, 获得 1 积分」—— 服务端认了
@@ -527,7 +528,7 @@ def test_api_get_points_stops_when_points_is_no_longer_a_decimal_string(monkeypa
     assert '{"code": 0, "points": 450, "streak": 1}' in caplog.text
 
 
-def test_api_checkin_stops_when_the_checkin_response_loses_points(monkeypatch, caplog):
+def test_api_checkin_stops_when_the_checkin_response_loses_points(_no_protocol_drift, monkeypatch, caplog):
     """失败模式: 签到响应里没有 points 字段, 旧代码会 KeyError 或记 0 分继续。"""
     api = checkin.API()
     api._wait_out_challenge = lambda: None
@@ -548,7 +549,7 @@ def test_api_checkin_stops_when_the_checkin_response_loses_points(monkeypatch, c
     assert '{"code": 0, "message": "ok"}' in caplog.text
 
 
-def test_a_shape_change_in_the_points_endpoint_turns_the_run_red(monkeypatch, caplog):
+def test_a_shape_change_in_the_points_endpoint_turns_the_run_red(_no_protocol_drift, monkeypatch, caplog):
     """需求: 接口变了就停机报错, 给出「先看原始响应再决定要不要适配」的下一步。
 
     签到那一步即使看着成功也不算通过 —— 用户要的是「有变化就暂停」, 而不是带着
@@ -886,7 +887,7 @@ def test_exchange_request_is_sent_once_points_reach_the_threshold(monkeypatch, _
     assert set(_stub_api["exchange_calls"]) == {"plan500"}
 
 
-def test_a_successful_exchange_is_visible_in_the_log(monkeypatch, caplog):
+def test_a_successful_exchange_is_visible_in_the_log(_no_protocol_drift, monkeypatch, caplog):
     """需求: 兑换成功必须留痕。
 
     它是一次扣掉 500 积分、改变账号状态的操作, 所以必须无条件留痕 ——
@@ -992,7 +993,18 @@ def _with_challenge(handler):
     return fake
 
 
-def test_api_checkin_hints_user_agent_when_automation_detected(monkeypatch, caplog):
+@pytest.fixture()
+def _no_protocol_drift(monkeypatch):
+    """跳过签到前的协议比对。
+
+    这些用例测的是请求形状 / 挑战 / 降级 / 兑换, 与协议预检无关; 不跳过的话
+    预检会去打真实网络, 用例就变成了「今天站点还在不在」的联网测试。
+    预检本身的行为由后面专门那组用例守着。
+    """
+    monkeypatch.setattr(checkin.API, "_protocol_drift", lambda self: [])
+
+
+def test_api_checkin_hints_user_agent_when_automation_detected(_no_protocol_drift, monkeypatch, caplog):
     """失败模式: 线上 2026-09-25 实测的 code 4 必须提示 GLADOS_USER_AGENT,
     而不是被误判成 Cookie 失效。
 
@@ -1028,7 +1040,7 @@ def test_api_checkin_hints_user_agent_when_automation_detected(monkeypatch, capl
     assert COOKIE_SENTINEL not in caplog.text
 
 
-def test_api_checkin_automation_hint_still_works_without_device_fields(monkeypatch, caplog):
+def test_api_checkin_automation_hint_still_works_without_device_fields(_no_protocol_drift, monkeypatch, caplog):
     """失败模式: 服务端只回 code 4 不带 reason/设备字段时, 提示不能崩也不能消失。"""
     api = checkin.API()
     automation = {"code": 4, "message": "Automated check-in detected."}
@@ -1044,6 +1056,195 @@ def test_api_checkin_automation_hint_still_works_without_device_fields(monkeypat
     assert result["status"] == "签到失败"
     assert "签到被判定为自动签到" in caplog.text
     assert "GLADOS_USER_AGENT" in caplog.text
+
+
+# --------------------------------------------------------------------------
+# 签到前的协议比对: 变了就停在提交之前
+# --------------------------------------------------------------------------
+
+PROTOCOL_1106 = os.path.join(REPO_ROOT, "tests", "fixtures", "site_protocol_2026-11-06.js")
+PROTOCOL_1107 = os.path.join(REPO_ROOT, "tests", "fixtures", "site_protocol_2026-11-07.js")
+PAGE_FIXTURE = os.path.join(REPO_ROOT, "tests", "fixtures", "site_checkin_page.html")
+
+
+def _read(path: str) -> str:
+    with open(path, encoding="utf-8") as fp:
+        return fp.read()
+
+
+def _site(monkeypatch, page: str, scripts: dict, posted: list) -> None:
+    """把抓页面 / 抓 JS / 提交签到三段都换成假网络。
+
+    ``scripts`` 的键是 ``parse_script_srcs`` 会从 ``page`` 里解析出来的路径, 值是该
+    chunk 的源码; 页面 fixture 里那 32 条 src 只认得其中一两条, 其余按抓失败处理 ——
+    真实站点上本来也会偶发抓不全。
+    """
+    def fake(self, url, method, data=None, cookies=""):
+        path = url.removeprefix(f"https://{checkin.DOMAIN}")
+        if path == checkin.API.PAGE_PATH:
+            return None if page is None else _FakeText(page)
+        if path in scripts:
+            return _FakeText(scripts[path])
+        if path == checkin.API.CHECKIN_URL:
+            posted.append(data)
+            return _FakeResponse({"code": 0, "points": 13})
+        return None
+
+    monkeypatch.setattr(checkin.API, "_make_request", fake)
+
+
+class _FakeText:
+    """只实现 ``.text``: 页面与 JS 都是纯文本, API 层只读这个属性。"""
+
+    def __init__(self, text):
+        self.text = text
+
+
+def test_both_real_builds_agree_with_the_declared_protocol():
+    """两份相隔一天的真实构建抽出的协议必须与 site_protocol.EXPECTED 一致。
+
+    这是「不会因为前端发版误报」的证据: 32 个 chunk 的构建 hash 全变、webpack 模块
+    编号从 613 变成 614, 但六个字段逐字相同。期望值来自这两份实测抓下来的源码。
+    """
+    for path in (PROTOCOL_1106, PROTOCOL_1107):
+        actual = site_protocol.fingerprint({os.path.basename(path): _read(path)})
+        assert site_protocol.drift(site_protocol.EXPECTED, actual) == [], path
+
+
+def test_drift_names_the_field_and_both_values():
+    """失败模式: 协议变了但报错只说『变了』, 人还得自己去翻两份 bundle。
+
+    两边都要写出来: 原来是什么、现在是什么。一个字段名 + 一个旧值 + 一个新值。
+    """
+    changed = _read(PROTOCOL_1107).replace(
+        "[103,108,97,100,111,115,45,111,98,115,101,114,118,101,45,118,49]",
+        "[103,108,97,100,111,115,45,111,98,115,101,114,118,101,45,118,50]",
+    )
+    actual = site_protocol.fingerprint({"bundle.js": changed})
+
+    problems = site_protocol.drift(site_protocol.EXPECTED, actual)
+
+    assert len(problems) == 1
+    assert "proof 盐值" in problems[0]
+    assert "glados-observe-v1" in problems[0]
+    assert "glados-observe-v2" in problems[0]
+
+
+def test_a_new_challenge_endpoint_counts_as_drift():
+    """失败模式: 站点把挑战换成 /user/checkin/attestation, 脚本照着老路径取 nonce。
+
+    接口清单是签到流程的骨架, 换了名字必须报出来 —— 这条正是 11-05 那次事故的形状。
+    """
+    changed = _read(PROTOCOL_1107).replace(
+        '"/user/checkin/challenge"', '"/user/checkin/attestation"'
+    )
+    actual = site_protocol.fingerprint({"bundle.js": changed})
+
+    problems = site_protocol.drift(site_protocol.EXPECTED, actual)
+
+    assert any("签到调用的接口" in problem for problem in problems)
+    assert any("/user/checkin/attestation" in problem for problem in problems)
+
+
+def test_extra_fields_the_script_never_reads_are_not_drift():
+    """多出来的接口或字段不算变化: 站点加功能是常态。
+
+    每次都报红只会训练人忽略红灯, 真出事那天就没人看了。
+    """
+    changed = _read(PROTOCOL_1107) + '\n;var x="/user/checkin/bonus";'
+    actual = site_protocol.fingerprint({"bundle.js": changed})
+
+    assert site_protocol.drift(site_protocol.EXPECTED, actual) == []
+
+
+def test_checkin_submits_nothing_when_the_protocol_changed(monkeypatch, caplog):
+    """需求: 协议变了要停在提交之前 —— 这才是『提前暂停』的意义。
+
+    如果只是等响应回来看形状, 分已经按新规则算完并降级了; 停在这里, 今天的分没动,
+    人看完再决定改不改脚本。
+    """
+    page = _read(PAGE_FIXTURE)
+    changed = _read(PROTOCOL_1107).replace(
+        '"/user/checkin/challenge"', '"/user/checkin/attestation"'
+    )
+    posted = []
+    _site(monkeypatch, page, {"/static/js/21.3a5e4a8b.chunk.js": changed}, posted)
+    api = checkin.API()
+
+    with caplog.at_level("ERROR"):
+        result = api.checkin(GLADOS_COOKIE)
+
+    assert result["code"] is checkin.CheckinStatus.FAILURE
+    assert result["reason"] == "protocol"
+    assert posted == [], "协议对不上时一个签到请求都不该发出去"
+    assert "签到协议变了" in caplog.text
+    assert "签到调用的接口" in caplog.text
+
+
+def test_an_unreadable_page_does_not_block_the_checkin(monkeypatch, caplog):
+    """页面抓不到时放行: 『这次没抓到』不等于『协议变了』。
+
+    为一次网络抖动拦下签到, 等于让抖动吃掉一天的分 —— 那比偶发降级更糟。
+    """
+    posted = []
+    _site(monkeypatch, None, {}, posted)
+    api = checkin.API()
+    api._fetch_challenge = lambda cookies: {"nonce": "n", "ttl": 300000}
+    api._wait_out_challenge = lambda: None
+    api._get_checkin_data = lambda challenge: {"token": "glados.cloud", "nonce": "n", "proof": "p"}
+
+    with caplog.at_level("WARNING"):
+        result = api.checkin(GLADOS_COOKIE)
+
+    assert result["code"] is checkin.CheckinStatus.SUCCESS
+    assert "跳过协议比对" in caplog.text
+
+
+def test_a_page_without_any_script_counts_as_drift(monkeypatch, caplog):
+    """页面 200 但一个 JS 都解析不出来 → 页面结构变了, 算变化。
+
+    『取到了但读不懂』和『没取到』是两回事: 前者说明前端换了打包方式或换了入口,
+    协议很可能跟着变了。
+    """
+    posted = []
+    _site(monkeypatch, "<html><body>maintenance</body></html>", {}, posted)
+    api = checkin.API()
+
+    with caplog.at_level("ERROR"):
+        result = api.checkin(GLADOS_COOKIE)
+
+    assert result["reason"] == "protocol"
+    assert posted == []
+    assert "一个 JS 都没解析到" in caplog.text
+
+
+def test_a_protocol_drift_keeps_the_run_red_and_skips_the_exchange(monkeypatch, caplog):
+    """端到端一行: 协议变了 → 退出码 1, 不去查余额, 更不去兑换。
+
+    签到都没提交, 余额是昨天的数, 照着它兑换等于拿旧数据做交易决策。
+    """
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
+    seen_urls = []
+
+    def fake_drift(self):
+        return ["签到调用的接口 变了: 原来是 ['/user/checkin', '/user/checkin/challenge'], 现在是 ['/user/checkin']"]
+
+    def fake_make_request(self, url, method, data=None, cookies=""):
+        seen_urls.append(url)
+        return None
+
+    monkeypatch.setattr(checkin.API, "_protocol_drift", fake_drift)
+    monkeypatch.setattr(checkin.API, "_make_request", fake_make_request)
+    monkeypatch.setattr(checkin.API, "get_points", lambda self, cookies: seen_urls.append("points") or ("500 积分", 500))
+    monkeypatch.setattr(checkin.API, "exchange", lambda self, cookies, plan: seen_urls.append("exchange"))
+
+    with caplog.at_level("INFO"):
+        exit_code = checkin.main()
+
+    assert exit_code == checkin.EXIT_CHECKIN_FAILED
+    assert "points" not in seen_urls
+    assert "exchange" not in seen_urls
+    assert "前端签到协议变了" in caplog.text
 
 
 # --------------------------------------------------------------------------
