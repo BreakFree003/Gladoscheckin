@@ -1,10 +1,14 @@
-import requests
+import hashlib
 import json
 import os
 import sys
+import time
+from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
-from dataclasses import dataclass
+
+import requests
+
 from logging_config import init_logger
 
 
@@ -49,6 +53,26 @@ PERMISSION_ERROR_HINTS: Tuple[str, ...] = ("没有权限", "no permission")
 很容易被误判成 Cookie 失效。"""
 AUTOMATION_ERROR_CODE = 4
 AUTOMATION_ERROR_HINTS: Tuple[str, ...] = ("automated check-in detected",)
+
+"""签到前的「观察挑战」(2026-11 起站点新增的门槛)。
+
+前端在点签到后会先 GET /api/user/checkin/challenge 拿一个一次性 nonce, 停顿至少
+2.5 秒, 再用 SHA-256 把 nonce 与固定盐值算成 proof 一起 POST 上去。没带 proof 的
+签到不再报错, 而是被当成「未验证」降级发放 (2026-11-05/06 连续两天实测只有 1 分,
+此前稳定 12~17 分), 所以这个挑战不做, 签到就没有意义。
+
+盐值是前端常量里的一串 char code:
+  [103,108,97,100,111,115,45,111,98,115,101,114,118,101,45,118,49]
+  → "glados-observe-v1"
+proof 算法: hex(SHA-256(nonce + "." + salt)), 小写十六进制 64 字符。"""
+CHALLENGE_SALT = "glados-observe-v1"
+
+"""拿到 nonce 后必须停顿的最短时间。
+
+前端 solveChallenge 里写死 `if ((now - at) < 2500) await sleep(2500 - (now - at))`,
+服务端按这个间隔区分「真人点了一下」和「脚本秒交」。停顿不够不会被拒, 只会白白
+浪费一次 nonce, 所以这里跟着前端一起停。"""
+CHALLENGE_MIN_DELAY_SECONDS = 2.5
 
 """进程退出码: 0 全部账号签到成功/重复签到; 1 有账号签到失败; 2 配置错误 (无 Cookie)"""
 EXIT_OK = 0
@@ -190,6 +214,7 @@ class API:
     CHECKIN_URL = "/api/user/checkin"
     POINTS_URL = "/api/user/points"
     EXCHANGE_URL = "/api/user/exchange"
+    CHALLENGE_URL = "/api/user/checkin/challenge"
 
     """POST 的 content-type, 与站点前端 axios 发出的一致 (带 charset, 无空格)。"""
     CONTENT_TYPE_JSON = "application/json;charset=UTF-8"
@@ -292,7 +317,7 @@ class API:
     def _serialize_post_body(self, data: Optional[Dict]) -> bytes:
         """按 axios 的方式序列化 JSON 请求体。
 
-        axios 用 `JSON.stringify` 的紧凑格式 (`{"token":"glados.cloud"}`), 而
+        axios 用 `JSON.stringify` 的紧凑格式 (`{"token":"glados.cloud","nonce":…}`), 而
         requests 的 `json=` 走 `json.dumps` 默认分隔符, 会多出空格
         (`{"token": "glados.cloud"}`)。这里对齐成浏览器那一份字节。"""
         return json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -330,22 +355,69 @@ class API:
             self._log("error", f"请求 {path} 时发生网络错误: {e}")
             return None
 
-    def _get_checkin_data(self) -> Dict[str, str]:
-        """获取签到数据: 站点前端发的就是 {token: location.hostname}"""
-        return {"token": DOMAIN}
+    def _fetch_challenge(self, cookies: str) -> Optional[Dict]:
+        """取一次「观察挑战」的 nonce。拿不到就返回 None, 由调用方决定拦下签到。
+
+        站点对未带 Cookie 的挑战请求直接回 code -2, 所以这里复用 _report_auth_error,
+        Cookie 失效时只输出一行可操作的提示, 不会因为多调一个接口而刷屏。"""
+        url = self._get_full_url(self.CHALLENGE_URL)
+        response = self._make_request(url, "GET", cookies=cookies)
+        if not response:
+            return None
+
+        data = response.json()
+        code = data.get("code", -2)
+        if code == CheckinStatus.SUCCESS.value and data.get("nonce"):
+            return data
+
+        message = data.get("message", "无消息字段")
+        if is_permission_error(code, message):
+            self._report_auth_error("checkin/challenge", message)
+        else:
+            self._log("error", f"取签到挑战失败: {response.text}")
+        return None
+
+    def _compute_proof(self, nonce: str) -> str:
+        """按前端的算法把 nonce 算成 proof: hex(SHA-256(nonce + "." + salt))。"""
+        return hashlib.sha256(f"{nonce}.{CHALLENGE_SALT}".encode("utf-8")).hexdigest()
+
+    def _wait_out_challenge(self) -> None:
+        """拿到 nonce 后停顿到前端要求的最短间隔, 再提交。"""
+        time.sleep(CHALLENGE_MIN_DELAY_SECONDS)
+
+    def _get_checkin_data(self, challenge: Dict) -> Dict[str, str]:
+        """拼签到请求体。
+
+        2026-11-06 抓包得到的字段顺序是 token → nonce → proof; 前端用
+        `Object.assign({token: hostname}, {nonce, proof})`, 所以 token 在最前。
+        顺序不影响服务端, 但字节对齐才能让抓包对照有意义。"""
+        nonce = challenge["nonce"]
+        return {"token": DOMAIN, "nonce": nonce, "proof": self._compute_proof(nonce)}
 
     @log_method
     def checkin(self, cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
-        """执行签到"""
+        """执行签到: 先取挑战 → 停顿 → 带上 nonce + proof 提交。
+
+        不取挑战直接 POST 也能「成功」, 但服务端会把它当成未验证的签到只给 1 分
+        (2026-11-05/06 连续两天实测), 且 code 仍是 0, 工作流那边看不出异常。所以挑战
+        失败时宁可判成签到失败、让当天的下一个 cron 槽重试, 也不要记一笔假成功。"""
         url = self._get_full_url(self.CHECKIN_URL)
-        checkin_data = self._get_checkin_data()
-        response = self._make_request(url, "POST", checkin_data, cookies)
 
         result = {
             "status": "签到失败",
             "points": "0",
             "code": CheckinStatus.FAILURE,
         }
+
+        challenge = self._fetch_challenge(cookies)
+        if not challenge:
+            # 具体原因已经在 _fetch_challenge 里输出过了
+            self._log("error", "未取到签到挑战, 本次签到作废 (不带 proof 的签到只会拿到 1 分)")
+            return result
+
+        self._wait_out_challenge()
+        checkin_data = self._get_checkin_data(challenge)
+        response = self._make_request(url, "POST", checkin_data, cookies)
 
         if response:
             data = response.json()

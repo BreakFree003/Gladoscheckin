@@ -170,13 +170,13 @@ GLADOS_USER_AGENT='粘贴你浏览器的 navigator.userAgent' \
 
 被判定为自动签到（`code 4`）的根因是「请求不像本人浏览器点的」。这里不是猜的，是拿真机
 抓包逐项对齐的 —— 期望值存在 [`tests/fixtures/browser_checkin_request.json`](tests/fixtures/browser_checkin_request.json)：
-2026-09-26 用 CDP 记录本机 Chrome 154（macOS）在 `https://glados.cloud/console/checkin`
-点「签到」时发出的那一次请求。
+2026-11-06 用 CDP 记录本机 Chrome 156（macOS）在 `https://glados.cloud/console/checkin`
+点「签到」时发出的那两次请求。
 
 | 项目 | 浏览器 | 脚本 |
 |---|---|---|
-| 方法 / 路径 | `POST /api/user/checkin` | 一致 |
-| 请求体 | `{"token":"glados.cloud"}`（24 字节，无空格） | 一致 |
+| 方法 / 路径 | `GET /api/user/checkin/challenge` → `POST /api/user/checkin` | 一致 |
+| 请求体 | `{"token":"glados.cloud","nonce":…,"proof":…}`（142 字节，无空格） | 一致 |
 | `content-type` | `application/json;charset=UTF-8` | 一致 |
 | `accept` | `application/json, text/plain, */*` | 一致 |
 | `origin` | `https://glados.cloud` | 一致 |
@@ -191,6 +191,28 @@ GLADOS_USER_AGENT='粘贴你浏览器的 navigator.userAgent' \
 `macOS` / `Windows` / `Linux` / `Android` / `iOS` / `Bot` / `Other`，正是从 User-Agent
 解析出来的。所以只要 `GLADOS_USER_AGENT` 是当初登录那个浏览器的 `navigator.userAgent`，
 平台就对得上。
+
+## 签到前的「观察挑战」
+
+2026-11-05 起签到收益从 12~17 掉到 1 分，原因是站点加了一道 attestation。前端代码里叫
+`checkinProof`，位置在 console 包的 `main~20e9f87d` 模块 613：
+
+```js
+salt = [103,108,97,100,111,115,45,111,98,115,101,114,118,101,45,118,49]  // "glados-observe-v1"
+proof = hex(SHA-256(nonce + "." + salt))
+```
+
+流程（与 `main~189dec1b` 的 `loadChallenge` / `solveChallenge` 逐行对齐）：
+
+1. `GET /api/user/checkin/challenge` 拿 `{nonce, ttl}`（`ttl` 实测 300000ms）；
+2. **至少停 2.5 秒**才提交 —— 前端写死 `if (Date.now() - at < 2500) await sleep(2500 - …)`；
+3. `POST /api/user/checkin`，体是 `{token, nonce, proof}`。
+
+不带 proof 的 POST 一样返回 `code 0`，但服务端当成「未验证」只给 1 分，Cable / Streak
+都不发。所以脚本现在是 **challenge 拿不到就判签到失败**（fail-closed），让当天下一个 cron
+槽重试，而不是记一笔看着成功的 1 分。
+
+算法本身没有秘密（nonce 由服务端发、盐是前端常量），这一步防的是「不知道要算」。
 
 ## 说明
 

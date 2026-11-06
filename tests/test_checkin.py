@@ -149,7 +149,10 @@ def _browser_capture() -> dict:
 
 
 class _RecordingHandler(BaseHTTPRequestHandler):
-    """把收到的请求原样记下来, 再回一份可解析的 JSON 响应。"""
+    """把收到的请求原样记下来, 再回一份可解析的 JSON 响应。
+
+    挑战接口 (``/api/user/checkin/challenge``) 与业务接口分别回不同的应答 ——
+    签到前一定先拿 nonce, 一个 ``server.payload`` 通吃会让挑战拿到业务应答。"""
 
     def _handle(self):
         length = int(self.headers.get("content-length") or 0)
@@ -160,7 +163,12 @@ class _RecordingHandler(BaseHTTPRequestHandler):
             "headers": {k.lower(): v for k, v in self.headers.items()},
             "body": body,
         })
-        payload = json.dumps(self.server.payload).encode()
+        payload_data = (
+            self.server.challenge_payload
+            if self.path.endswith(checkin.API.CHALLENGE_URL)
+            else self.server.payload
+        )
+        payload = json.dumps(payload_data).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json; charset=utf-8")
         self.send_header("content-length", str(len(payload)))
@@ -174,12 +182,19 @@ class _RecordingHandler(BaseHTTPRequestHandler):
         pass
 
 
-def _capture_request(monkeypatch, payload: dict, call) -> dict:
-    """把 API 调用真的发到本机 HTTP 服务器, 返回线上缆的 method/path/headers/body。"""
+def _capture_request(monkeypatch, payload: dict, call, challenge_payload=None) -> list:
+    """把 API 调用真的发到本机 HTTP 服务器, 返回线上缆的 method/path/headers/body 列表。
+
+    默认用抓包 fixture 里那对真实的 nonce/ttl 回挑战请求, 于是签到请求的请求体可以
+    逐字节对照浏览器的 postData。"""
+    if challenge_payload is None:
+        challenge_payload = _browser_capture()["challenge"]["response"]
+
     server = ThreadingHTTPServer(("127.0.0.1", 0), _RecordingHandler)
     server.daemon_threads = True
     server.recorded = []
     server.payload = payload
+    server.challenge_payload = challenge_payload
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setattr(
@@ -193,16 +208,14 @@ def _capture_request(monkeypatch, payload: dict, call) -> dict:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
-
-    assert len(server.recorded) == 1, server.recorded
-    return server.recorded[0]
+    return server.recorded
 
 
 def test_checkin_wire_request_matches_the_captured_browser_request(monkeypatch):
     """失败模式: 请求体 / content-type / accept / origin / UA 与网页点签到时不一致。
 
     期望值逐项来自浏览器抓包 (tests/fixtures/browser_checkin_request.json):
-    请求体是紧凑 JSON ``{"token":"glados.cloud"}`` 共 24 字节, content-type 带
+    请求体是紧凑 JSON ``{"token","nonce","proof"}`` 共 142 字节, content-type 带
     ``charset=UTF-8``, GET 与 POST 都不带 Referer。
     """
     capture = _browser_capture()
@@ -213,15 +226,17 @@ def test_checkin_wire_request_matches_the_captured_browser_request(monkeypatch):
         monkeypatch,
         {"code": 1, "message": "Today's observation logged."},
         lambda: api.checkin(GLADOS_COOKIE),
+        challenge_payload=capture["challenge"]["response"],
     )
 
-    assert recorded["method"] == browser["method"] == "POST"
-    assert recorded["path"] == "/api/user/checkin"
-    assert recorded["body"].decode() == browser["postData"]
-    assert len(recorded["body"]) == browser["contentLength"]
+    checkin_request = recorded[-1]
+    assert checkin_request["method"] == browser["method"] == "POST"
+    assert checkin_request["path"] == "/api/user/checkin"
+    assert checkin_request["body"].decode() == browser["postData"]
+    assert len(checkin_request["body"]) == browser["contentLength"]
     for name in ("accept", "content-type", "origin", "user-agent", "content-length"):
-        assert recorded["headers"][name] == browser["headers"][name], name
-    assert recorded["headers"]["cookie"] == GLADOS_COOKIE
+        assert checkin_request["headers"][name] == browser["headers"][name], name
+    assert checkin_request["headers"]["cookie"] == GLADOS_COOKIE
 
 
 def test_checkin_sends_no_header_the_browser_never_sends(monkeypatch):
@@ -241,10 +256,11 @@ def test_checkin_sends_no_header_the_browser_never_sends(monkeypatch):
         monkeypatch, {"code": 1, "message": "repeat"}, lambda: api.checkin(GLADOS_COOKIE)
     )
 
-    unexpected = set(recorded["headers"]) - browser_headers - client_only
+    checkin_request = recorded[-1]
+    unexpected = set(checkin_request["headers"]) - browser_headers - client_only
     assert unexpected == set(), f"脚本多发了浏览器没有的头: {sorted(unexpected)}"
-    assert "referer" not in recorded["headers"]
-    assert "authorization" not in recorded["headers"]
+    assert "referer" not in checkin_request["headers"]
+    assert "authorization" not in checkin_request["headers"]
 
 
 def test_api_exchange_posts_compact_json_plan_type_like_the_web_console(monkeypatch):
@@ -256,9 +272,10 @@ def test_api_exchange_posts_compact_json_plan_type_like_the_web_console(monkeypa
         lambda: api.exchange(GLADOS_COOKIE, "plan500"),
     )
 
-    assert recorded["path"] == "/api/user/exchange"
-    assert recorded["body"] == b'{"planType":"plan500"}'
-    assert recorded["headers"]["content-type"] == "application/json;charset=UTF-8"
+    [request] = recorded
+    assert request["path"] == "/api/user/exchange"
+    assert request["body"] == b'{"planType":"plan500"}'
+    assert request["headers"]["content-type"] == "application/json;charset=UTF-8"
 
 
 def test_api_get_requests_carry_no_content_type_or_referer(monkeypatch):
@@ -271,10 +288,92 @@ def test_api_get_requests_carry_no_content_type_or_referer(monkeypatch):
         lambda: api.get_points(GLADOS_COOKIE),
     )
 
-    assert recorded["method"] == "GET"
-    assert "content-type" not in recorded["headers"]
-    assert "referer" not in recorded["headers"]
-    assert recorded["headers"]["cookie"] == GLADOS_COOKIE
+    [request] = recorded
+    assert request["method"] == "GET"
+    assert "content-type" not in request["headers"]
+    assert "referer" not in request["headers"]
+    assert request["headers"]["cookie"] == GLADOS_COOKIE
+
+
+def test_checkin_challenge_request_matches_the_captured_browser_request(monkeypatch):
+    """失败模式: 取挑战这一步的请求形态与浏览器不一致 (或者干脆没发)。
+
+    期望值来自同一次抓包: GET /api/user/checkin/challenge, 只带 accept / UA /
+    origin, 不带 content-type, 也不带 Referer。
+    """
+    capture = _browser_capture()
+    api = checkin.API(user_agent=capture["browser"]["user_agent"])
+
+    recorded = _capture_request(
+        monkeypatch,
+        {"code": 1, "message": "Today's observation logged."},
+        lambda: api.checkin(GLADOS_COOKIE),
+    )
+
+    challenge_request = recorded[0]
+    assert challenge_request["method"] == "GET"
+    assert challenge_request["path"] == checkin.API.CHALLENGE_URL
+    assert challenge_request["body"] == b""
+    for name in ("accept", "origin", "user-agent"):
+        assert challenge_request["headers"][name] == capture["request"]["headers"][name], name
+    assert "content-type" not in challenge_request["headers"]
+    assert "referer" not in challenge_request["headers"]
+
+
+def test_proof_is_the_hash_the_browser_actually_sent():
+    """失败模式: proof 算法 (盐值 / 拼接符 / 编码) 与服务端要的那一份不一致。
+
+    期望值是两次独立真机抓包里浏览器自己算出来的 nonce → proof 对
+    (tests/fixtures/browser_checkin_request.json 的 known_proofs), 不是从实现反推的。
+    算法写错的后果很具体: 服务端认可 code 0, 但只给 1 分。
+    """
+    api = checkin.API()
+
+    for pair in _browser_capture()["known_proofs"]["pairs"]:
+        assert api._compute_proof(pair["nonce"]) == pair["proof"], pair["nonce"]
+
+
+def test_checkin_waits_out_the_challenge_window_before_posting(monkeypatch):
+    """失败模式: 拿到 nonce 立刻提交。
+
+    站点前端拿到 nonce 后强制停顿 2500ms 才 POST (bundle main~189dec1b 里写死的
+    常量), 抓包里两次请求也隔了 3.6 秒。停顿值直接取自这段前端逻辑。
+    """
+    api = checkin.API()
+    sleeps = []
+
+    # 换掉 time.sleep 而不是 _wait_out_challenge: 后者一换, 真正那行 sleep 就没人测了。
+    monkeypatch.setattr(checkin.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(api, "_fetch_challenge", lambda cookies: {"nonce": "n", "ttl": 300000})
+    monkeypatch.setattr(api, "_make_request", lambda *a, **k: _FakeResponse({"code": 0, "points": 13}))
+
+    api.checkin(GLADOS_COOKIE)
+
+    assert sleeps == [2.5], "拿到 nonce 后必须停顿前端要求的 2500ms 再提交"
+
+
+def test_checkin_fails_closed_when_the_challenge_is_unavailable(monkeypatch, caplog):
+    """需求: 拿不到 nonce 就不要发签到请求。
+
+    不取挑战也能 POST「成功」(code 0), 但服务端只给 1 分, 工作流看不出异常 ——
+    2026-11-04/05/06 就是这么连着三天掉到 1 分的。宁可判失败让下一个 cron 槽重试。
+    """
+    api = checkin.API()
+    posted = []
+
+    monkeypatch.setattr(api, "_fetch_challenge", lambda cookies: None)
+    monkeypatch.setattr(
+        api, "_make_request",
+        lambda *a, **k: posted.append(a) or _FakeResponse({"code": 0, "points": 13}),
+    )
+
+    with caplog.at_level("ERROR"):
+        result = api.checkin(GLADOS_COOKIE)
+
+    assert result["status"] == "签到失败"
+    assert result["code"] is checkin.CheckinStatus.FAILURE
+    assert posted == [], "拿不到 nonce 时不该发签到请求"
+    assert "签到挑战" in caplog.text
 
 
 
@@ -571,14 +670,14 @@ def test_a_successful_exchange_is_visible_in_the_log(monkeypatch, caplog):
     """
     monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
 
-    def fake_make_request(self, url, method, data=None, cookies=""):
+    def handler(self, url, method, data=None, cookies=""):
         if url.endswith(checkin.API.POINTS_URL):
             return _FakeResponse({"code": 0, "points": checkin.Config.EXCHANGE_PLAN_POINTS})
         if url.endswith(checkin.API.EXCHANGE_URL):
             return _FakeResponse({"code": 0, "message": "ok"})
         return _FakeResponse({"code": 0, "points": 13, "message": "checkin ok"})
 
-    monkeypatch.setattr(checkin.API, "_make_request", fake_make_request)
+    monkeypatch.setattr(checkin.API, "_make_request", _with_challenge(handler))
 
     with caplog.at_level("INFO"):
         exit_code = checkin.main()
@@ -611,13 +710,20 @@ def test_exchange_uses_the_hardcoded_plan500(monkeypatch, _stub_api):
 
 
 def test_api_checkin_reports_failure_when_request_raises(monkeypatch):
-    """失败模式: 网络异常被 log_method 兜底后必须仍是「签到失败」而不是成功。"""
-    api = checkin.API()
+    """失败模式: 网络异常被 log_method 兜底后必须仍是「签到失败」而不是成功。
 
-    def boom(*args, **kwargs):
+    挑战请求放过 (回到抓包 fixture 那对 nonce/ttl), 只有签到 POST 抛错 ——
+    否则挑战先挂掉, 就分不清到底是哪一步没兜住。
+    """
+    api = checkin.API()
+    challenge_response = _browser_capture()["challenge"]["response"]
+
+    def boom(url, method, data=None, cookies=""):
         raise checkin.requests.exceptions.ConnectionError("boom")
 
-    monkeypatch.setattr(api.session, "post", boom)
+    # 只让签到那一步炸: 挑战照常返回抓包里那对 nonce/ttl, 否则分不清是哪一步没兜住。
+    monkeypatch.setattr(api, "_fetch_challenge", lambda cookies: challenge_response)
+    monkeypatch.setattr(api, "_make_request", boom)
 
     result = api.checkin(GLADOS_COOKIE)
 
@@ -626,13 +732,33 @@ def test_api_checkin_reports_failure_when_request_raises(monkeypatch):
 
 
 class _FakeResponse:
-    """只实现 API 层用到的 json()。"""
+    """只实现 API 层用到的 json() 与 text。"""
 
     def __init__(self, payload):
         self._payload = payload
 
     def json(self):
         return self._payload
+
+    @property
+    def text(self):
+        return json.dumps(self._payload)
+
+
+def _with_challenge(handler):
+    """包一层 _make_request 的替身: 挑战接口自动回抓包 fixture 里那对真实 nonce/ttl。
+
+    签到前一定先取挑战, 所以直接把整个 _make_request 换成一个固定应答, 挑战会拿到
+    业务应答 (比如 code 4), 于是根本走不到被测分支 —— 那样绿得毫无意义。
+    """
+    challenge_response = _browser_capture()["challenge"]["response"]
+
+    def fake(self, url, method, data=None, cookies=""):
+        if url.endswith(checkin.API.CHALLENGE_URL):
+            return _FakeResponse(challenge_response)
+        return handler(self, url, method, data, cookies)
+
+    return fake
 
 
 def test_api_checkin_hints_user_agent_when_automation_detected(monkeypatch, caplog):
@@ -646,18 +772,17 @@ def test_api_checkin_hints_user_agent_when_automation_detected(monkeypatch, capl
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
     )
+    automation = {
+        "code": 4,
+        "message": "Automated check-in detected. Please sign in again to continue.",
+        "reason": "device-mismatch",
+        "loginDevice": "macos",
+        "currentDevice": "windows",
+    }
     monkeypatch.setattr(
-        api,
+        checkin.API,
         "_make_request",
-        lambda *a, **k: _FakeResponse(
-            {
-                "code": 4,
-                "message": "Automated check-in detected. Please sign in again to continue.",
-                "reason": "device-mismatch",
-                "loginDevice": "macos",
-                "currentDevice": "windows",
-            }
-        ),
+        _with_challenge(lambda self, url, method, data=None, cookies="": _FakeResponse(automation)),
     )
 
     with caplog.at_level("ERROR"):
@@ -675,10 +800,11 @@ def test_api_checkin_hints_user_agent_when_automation_detected(monkeypatch, capl
 def test_api_checkin_automation_hint_still_works_without_device_fields(monkeypatch, caplog):
     """失败模式: 服务端只回 code 4 不带 reason/设备字段时, 提示不能崩也不能消失。"""
     api = checkin.API()
+    automation = {"code": 4, "message": "Automated check-in detected."}
     monkeypatch.setattr(
-        api,
+        checkin.API,
         "_make_request",
-        lambda *a, **k: _FakeResponse({"code": 4, "message": "Automated check-in detected."}),
+        _with_challenge(lambda self, url, method, data=None, cookies="": _FakeResponse(automation)),
     )
 
     with caplog.at_level("ERROR"):
