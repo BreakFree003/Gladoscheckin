@@ -18,6 +18,9 @@ class CheckinStatus(Enum):
     SUCCESS = 0
     REPEAT = 1
     FAILURE = -2
+    # 服务端回 code 0、但给的分数低于正常下限。站点自己的 code 里没有这一档
+    # (它只回 0/1/-2/4), 2 不会与任何一个撞上, 所以借它表示「成功了但不对劲」。
+    DEGRADED = 2
 
 
 class LogEmoji:
@@ -29,6 +32,7 @@ class LogEmoji:
 
     SUCCESS = "✅"
     REPEAT = "🔄"
+    DEGRADED = "⚠️"
     FAIL = "❌"
 
 
@@ -74,6 +78,39 @@ CHALLENGE_SALT = "glados-observe-v1"
 浪费一次 nonce, 所以这里跟着前端一起停。"""
 CHALLENGE_MIN_DELAY_SECONDS = 2.5
 
+"""一次正常签到至少该拿到多少分。低于它, 这次签到算失败。
+
+为什么要这个数: 站点把「没做挑战的签到」降级成 1 分时, 响应仍然是 code 0 —— 光看
+code 会把降级当成成功, 白丢一天的分还以为一切正常 (2026-11-05/06 就是这样过去的)。
+站点没有给出任何语义字段说明「这是降级分」, 只能按数值判断。
+
+取 2 的依据是 51 条历史流水 (2026-09-20 ~ 2026-11-07): 正常值下限是 7 (Cable 质量
+差的 09-20 / 09-25 / 10-28 三天), 常见 12~14, 唯一的异常值是降级那两天的 1。阈值
+贴着 1 取 2, 差一天的 Cable 分也不会被误判。"""
+MIN_EXPECTED_POINTS = 2
+
+"""接口响应的字段契约: (端点, code) -> {脚本读取的字段: 期望类型}。
+
+为什么要有: 站点把字段改名或换类型时, `data.get("points", 0)` 会安静地返回默认值,
+于是「签到成功 0 分」照样退出 0。这类静默失败比报错难查得多, 所以宁可停机。
+
+只声明脚本真正读取的字段, 并且类型都取自实测响应:
+- challenge 成功: {"code":0,"nonce":"…","ttl":300000} → nonce 是字符串
+- checkin code 0: 本次获得的分数是**整数** (2026-11-07 实跑 log 打出「获得 10 积分」,
+  旧代码是 str(data["points"]) 直出, 所以服务端给的就是 10 而不是 "10.000…")
+- points 成功: points 是 "450.0000000000000000" 这样的**字符串**
+
+重复签到 (code 1) 不列契约: 那两个分支一个字段都不读 (分数直接记 0), 要求它带
+points 只是替站点加约束 —— 契约只该守住脚本真正依赖的东西。
+
+服务端新增字段不算违约 —— 那不影响签到, 而每次发版都报一次警只会训练人忽略红色
+通知。没在这里声明的 code 也不校验, 交给各自的失败分支去解释。"""
+CONTRACTS: Dict[Tuple[str, int], Dict[str, type]] = {
+    ("checkin/challenge", 0): {"nonce": str},
+    ("checkin", 0): {"points": int},
+    ("points", 0): {"points": str},
+}
+
 """进程退出码: 0 全部账号签到成功/重复签到; 1 有账号签到失败; 2 配置错误 (无 Cookie)"""
 EXIT_OK = 0
 EXIT_CHECKIN_FAILED = 1
@@ -113,6 +150,40 @@ def is_automation_blocked(code: int, message: str) -> bool:
     )
 
 
+def _type_name(expected: type) -> str:
+    """把契约里的类型写成人看得懂的名字。"""
+    return {str: "字符串", int: "整数", list: "数组", dict: "对象"}.get(expected, expected.__name__)
+
+
+def _describe_type(value) -> str:
+    """描述实际值的类型, int 要排除 bool —— JSON 里 true 也是 int 的实例。"""
+    if isinstance(value, bool):
+        return "布尔值"
+    return _type_name(type(value))
+
+
+def contract_violations(endpoint: str, code: int, data: Dict) -> List[str]:
+    """校验一个响应是否满足 CONTRACTS 里声明的字段契约, 返回违约说明 (空表示合格)。
+
+    只查「脚本要用的字段在不在、类型对不对」。服务端加字段不算违约。
+    """
+    expected = CONTRACTS.get((endpoint, code))
+    if expected is None:
+        return []
+
+    problems: List[str] = []
+    for field, field_type in expected.items():
+        if field not in data:
+            problems.append(f"缺少字段 {field}")
+            continue
+        value = data[field]
+        if isinstance(value, bool) or not isinstance(value, field_type):
+            problems.append(
+                f"字段 {field} 应为{_type_name(field_type)}, 实际是{_describe_type(value)}"
+            )
+    return problems
+
+
 def log_method(func):
     """异常兜底装饰器: 把 API 方法的异常记进日志, 并返回该方法对应的失败默认值。
 
@@ -128,7 +199,7 @@ def log_method(func):
             logger.error(f"API {method_name} 执行失败: {e}")
 
             DEFAULT_ERRORS = {
-                "checkin": {"status": "签到失败", "points": "0"},
+                "checkin": {"status": "签到失败", "points": "0", "reason": "request"},
                 "get_points": ("None 积分", 0),
                 "exchange": "",
             }
@@ -224,6 +295,10 @@ class API:
         self.headers: Dict[str, str] = self._get_headers()
         self._auth_error_reported: bool = False
         self._automation_error_reported: bool = False
+        # 挑战失败的具体原因 (challenge/request/contract/auth/unknown), 给上层选提示用
+        self._challenge_failure: str = "challenge"
+        # 查总积分失败的原因 (request/contract/unavailable); 空串表示没失败
+        self._points_failure: str = ""
         self.session = requests.Session()
         self.session.headers.update(self.headers)
 
@@ -233,6 +308,11 @@ class API:
             self.session.close()
         except Exception as e:
             logger.error(f"关闭 session 时发生错误: {e}")
+
+    @property
+    def points_failure(self) -> str:
+        """上一次 get_points 的失败原因 (空串表示成功)。"""
+        return self._points_failure
 
     def __enter__(self):
         """进入上下文管理器"""
@@ -314,6 +394,18 @@ class API:
             "(Windows / Linux / iPhone 的 UA 实测都会被拦下)",
         )
 
+    def _report_contract_violation(self, endpoint: str, response: requests.Response, problems: List[str]) -> None:
+        """接口形状对不上时, 把「期望什么、实际收到什么」一次说清。
+
+        关键在于带上**完整原始响应**: 只报「字段 points 类型不对」还是得自己去复现
+        一次才知道它改成了什么; 而把 raw body 逐字打出来, 日志本身就是证据 ——
+        停机之后直接看这一行就能决定要不要适配。"""
+        self._log(
+            "error",
+            f"接口 {endpoint} 的响应形状变了 (契约不符): {'; '.join(problems)}。"
+            f"原始响应: {response.text}",
+        )
+
     def _serialize_post_body(self, data: Optional[Dict]) -> bytes:
         """按 axios 的方式序列化 JSON 请求体。
 
@@ -359,22 +451,36 @@ class API:
         """取一次「观察挑战」的 nonce。拿不到就返回 None, 由调用方决定拦下签到。
 
         站点对未带 Cookie 的挑战请求直接回 code -2, 所以这里复用 _report_auth_error,
-        Cookie 失效时只输出一行可操作的提示, 不会因为多调一个接口而刷屏。"""
+        Cookie 失效时只输出一行可操作的提示, 不会因为多调一个接口而刷屏。
+
+        失败原因写进 self._challenge_failure, 让上层能给出对症的下一步 ——
+        「Cookie 过期」和「挑战接口改版」需要完全不同的动作。"""
+        self._challenge_failure = "challenge"
         url = self._get_full_url(self.CHALLENGE_URL)
         response = self._make_request(url, "GET", cookies=cookies)
         if not response:
+            self._challenge_failure = "request"
             return None
 
         data = response.json()
         code = data.get("code", -2)
+
+        problems = contract_violations("checkin/challenge", code, data)
+        if problems:
+            self._report_contract_violation("checkin/challenge", response, problems)
+            self._challenge_failure = "contract"
+            return None
+
         if code == CheckinStatus.SUCCESS.value and data.get("nonce"):
             return data
 
         message = data.get("message", "无消息字段")
         if is_permission_error(code, message):
             self._report_auth_error("checkin/challenge", message)
+            self._challenge_failure = "auth"
         else:
             self._log("error", f"取签到挑战失败: {response.text}")
+            self._challenge_failure = "unknown"
         return None
 
     def _compute_proof(self, nonce: str) -> str:
@@ -400,19 +506,24 @@ class API:
 
         不取挑战直接 POST 也能「成功」, 但服务端会把它当成未验证的签到只给 1 分
         (2026-11-05/06 连续两天实测), 且 code 仍是 0, 工作流那边看不出异常。所以挑战
-        失败时宁可判成签到失败、让当天的下一个 cron 槽重试, 也不要记一笔假成功。"""
+        失败时宁可判成签到失败、让当天的下一个 cron 槽重试, 也不要记一笔假成功。
+
+        同理, code 0 但分数低于 MIN_EXPECTED_POINTS 也判失败 (DEGRADED): 分数是脚本
+        唯一能看见的「这次签到到底算不算数」的证据。"""
         url = self._get_full_url(self.CHECKIN_URL)
 
         result = {
             "status": "签到失败",
             "points": "0",
             "code": CheckinStatus.FAILURE,
+            "reason": "",
         }
 
         challenge = self._fetch_challenge(cookies)
         if not challenge:
             # 具体原因已经在 _fetch_challenge 里输出过了
             self._log("error", "未取到签到挑战, 本次签到作废 (不带 proof 的签到只会拿到 1 分)")
+            result["reason"] = self._challenge_failure
             return result
 
         self._wait_out_challenge()
@@ -423,12 +534,24 @@ class API:
             data = response.json()
             code = data.get("code", -2)
             message = data.get("message", "无消息字段")
-            points = str(data.get("points", 0))
+
+            # 形状对不上就先停下: 后面的 code/points 读取全部建立在它成立之上。
+            problems = contract_violations("checkin", code, data)
+            if problems:
+                self._report_contract_violation("checkin", response, problems)
+                result["reason"] = "contract"
+                return result
 
             if code == CheckinStatus.SUCCESS.value:
-                result["code"] = CheckinStatus.SUCCESS
-                result["status"] = "签到成功"
-                result["points"] = points
+                points = data["points"]
+                result["points"] = str(points)
+                if points < MIN_EXPECTED_POINTS:
+                    result["code"] = CheckinStatus.DEGRADED
+                    result["status"] = f"签到只拿到 {points} 分 (低于正常下限 {MIN_EXPECTED_POINTS})"
+                    result["reason"] = "degraded"
+                else:
+                    result["code"] = CheckinStatus.SUCCESS
+                    result["status"] = "签到成功"
             elif code == CheckinStatus.REPEAT.value:
                 result["code"] = CheckinStatus.REPEAT
                 result["status"] = "重复签到"
@@ -438,43 +561,59 @@ class API:
                 # 才需要在这里留下原始 code 与 message。
                 if is_permission_error(code, message):
                     self._report_auth_error("checkin", message)
+                    result["reason"] = "auth"
                 elif is_automation_blocked(code, message):
                     self._report_automation_block(data)
+                    result["reason"] = "automation"
                 else:
                     # 已知原因各有专门的一行解释; 剩下的只有原始响应能说明问题
                     # (服务端加字段时, 这里就能看见)。
                     self._log("error", f"签到失败: {response.text}")
+                    result["reason"] = "unknown"
                 result["code"] = CheckinStatus.FAILURE
                 result["status"] = "签到失败"
                 result["points"] = "0"
         else:
             result["code"] = CheckinStatus.FAILURE
             result["status"] = "签到失败"
+            result["reason"] = "request"
 
         return result
 
     @log_method
     def get_points(self, cookies: str) -> Tuple[str, int]:
         """获取总积分。第二个返回值是给兑换门槛用的数字。"""
+        self._points_failure = ""
         url = self._get_full_url(self.POINTS_URL)
         response = self._make_request(url, "GET", cookies=cookies)
 
-        if response:
-            data = response.json()
-            code = data.get("code", -2)
-            message = data.get("message", "")
-            points = data.get("points", None)
-
-            if points is not None:
-                points_int = int(float(points))
-                return f"{points_int} 积分", points_int
-
-            if is_permission_error(code, message):
-                self._report_auth_error("points", message)
-            else:
-                self._log("warning", f"读取总积分失败: {response.text}")
+        if not response:
+            self._points_failure = "request"
             return "None 积分", 0
 
+        data = response.json()
+        code = data.get("code", -2)
+        message = data.get("message", "")
+
+        # points 在实测里是 "450.0000000000000000" 这样的字符串; 变成数字就说明
+        # 契约变了, 而 int(float(...)) 在别的类型上会静默算出别的数。
+        problems = contract_violations("points", code, data)
+        if problems:
+            self._report_contract_violation("points", response, problems)
+            self._points_failure = "contract"
+            return "None 积分", 0
+
+        points = data.get("points", None)
+
+        if points is not None:
+            points_int = int(float(points))
+            return f"{points_int} 积分", points_int
+
+        if is_permission_error(code, message):
+            self._report_auth_error("points", message)
+        else:
+            self._log("warning", f"读取总积分失败: {response.text}")
+        self._points_failure = "unavailable"
         return "None 积分", 0
 
     @log_method
@@ -513,11 +652,15 @@ class CheckinResult:
     points: str = "0"
     points_total: str = "None"
     exchange: str = ""
-    code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
+    code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, 2: 降级, -2: 失败
+    reason: str = ""  # 失败/降级的原因, 决定 main() 给出哪一条下一步提示
 
     @property
     def passed(self) -> bool:
-        """签到成功与重复签到都算通过, 其余一律算失败 (fail-closed)。"""
+        """只有签到成功与重复签到算通过, 降级与失败一律算失败 (fail-closed)。
+
+        降级 (code 0 但分数低于正常下限) 必须算失败: 站点不会为它返回错误, 唯一的
+        信号就是分数本身, 放过它就等于每天白丢分还以为一切正常。"""
         return self.code in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
 
     def describe(self) -> str:
@@ -525,6 +668,7 @@ class CheckinResult:
         emoji = {
             CheckinStatus.SUCCESS: LogEmoji.SUCCESS,
             CheckinStatus.REPEAT: LogEmoji.REPEAT,
+            CheckinStatus.DEGRADED: LogEmoji.DEGRADED,
             CheckinStatus.FAILURE: LogEmoji.FAIL,
         }[self.code]
 
@@ -532,7 +676,8 @@ class CheckinResult:
         if self.code is CheckinStatus.FAILURE:
             return line
 
-        # 重复签到时没有"获得"可言, 硬写一句"获得 0 积分"看着像 bug。
+        # 重复签到时没有"获得"可言, 硬写一句"获得 0 积分"看着像 bug; 降级的分数
+        # 已经写在状态里了, 再补一次就成了"只拿到 1 分, 获得 1 积分"。
         earned = f"获得 {self.points} 积分, " if self.code is CheckinStatus.SUCCESS else ""
         return f"{line}, {earned}总 {self.points_total}, {self.exchange}"
 
@@ -547,10 +692,20 @@ def run_checkin(config: Config) -> CheckinResult:
         result.status = checkin_result["status"]
         result.code = checkin_result.get("code", CheckinStatus.FAILURE)
         result.points = checkin_result.get("points", "0")
+        result.reason = checkin_result.get("reason", "")
 
         # 2. 总积分
         points_str, points_num = api.get_points(config.cookie)
         result.points_total = points_str
+
+        # 查总积分时撞上契约变更, 说明站点接口已经动过。这时候即便签到那一步看着
+        # 成功, 也不能算通过 —— 用户要的是「有变化就停下、先报错」, 而不是带着一个
+        # 自己都没法确认的状态继续跑到兑换。签到本身的结果仍留在 status 里。
+        if api.points_failure == "contract":
+            result.code = CheckinStatus.FAILURE
+            result.reason = "contract"
+            result.status = f"签到结果无法确认 (积分接口形状不符): {result.status}"
+            return result
 
         # 3. 兑换: 积分没到门槛就不发这个请求。服务端对积分不够只会回
         #    "Not enough points", 每天发一次、再报一次错既没用又像是故障。
@@ -565,6 +720,33 @@ def run_checkin(config: Config) -> CheckinResult:
 
 # 初始化日志
 logger = init_logger()
+
+
+"""按失败原因给出下一步。每一种都指向一个具体动作, 不含「请重试」这种废话。"""
+NEXT_STEPS: Dict[str, str] = {
+    "contract": (
+        "站点接口的响应形状变了, 脚本已停机 (没有继续猜着签)。"
+        "上一条 ERROR 里有完整原始响应, 照着它改 CONTRACTS 与解析逻辑再打开工作流"
+    ),
+    "degraded": (
+        "签到被服务端降级记分 (code 0 但分数低于正常下限)。"
+        "先看是否仍能取到 challenge、proof 是否按 SHA-256(nonce + '.' + 盐) 算出; "
+        "若站点又加了新环节, 抓一次网页端签到请求对照"
+    ),
+    "challenge": (
+        "没取到「观察挑战」的 nonce, 所以没提交签到。"
+        "若 Cookie 未过期, 多半是 /api/user/checkin/challenge 变了"
+    ),
+    "auth": (
+        f"请检查 Cookie 是否完整/过期 ({DOMAIN} 需要 {' 与 '.join(COOKIE_KEYS)} 两个字段)"
+    ),
+    "automation": (
+        f"签到被判定为自动签到 (code 4), 需把登录浏览器的 navigator.userAgent 设为 "
+        f"{Config.ENV_USER_AGENT}"
+    ),
+    "request": "签到请求没有成功发出或返回非 2xx, 先看上面那行原始响应",
+    "unknown": "签到返回了没见过的 code, 先看上一条 ERROR 里的原始响应",
+}
 
 
 def main() -> int:
@@ -592,7 +774,7 @@ def main() -> int:
 
             if not result.passed:
                 exit_code = EXIT_CHECKIN_FAILED
-                next_step = (
+                next_step = NEXT_STEPS.get(result.reason) or (
                     f"请检查 Cookie 是否完整/过期 ({DOMAIN} 需要 {' 与 '.join(COOKIE_KEYS)} 两个字段), "
                     f"或签到被判定为自动签到 (code 4, 需设置 {Config.ENV_USER_AGENT})"
                 )

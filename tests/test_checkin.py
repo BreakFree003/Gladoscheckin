@@ -376,6 +376,229 @@ def test_checkin_fails_closed_when_the_challenge_is_unavailable(monkeypatch, cap
     assert "签到挑战" in caplog.text
 
 
+def test_checkin_marks_a_one_point_result_as_degraded(monkeypatch):
+    """需求: code 0 但只拿到 1 分必须判成降级, 不能记成功。
+
+    2026-11-05 与 11-06 的线上日志都是「✅ 签到成功, 获得 1 积分」—— 服务端认了
+    签到 (code 0), 但分数被降级到 1。这个信号只有分数本身, 判成成功就等于每天
+    白丢 11 分还发一封「一切正常」的绿勾。
+    """
+    api = checkin.API()
+    api._wait_out_challenge = lambda: None
+    monkeypatch.setattr(
+        checkin.API,
+        "_make_request",
+        _with_challenge(lambda self, url, method, data=None, cookies="": _FakeResponse(
+            {"code": 0, "points": 1, "message": "ok"}
+        )),
+    )
+
+    result = api.checkin(GLADOS_COOKIE)
+
+    assert result["code"] is checkin.CheckinStatus.DEGRADED
+    assert result["reason"] == "degraded"
+    assert "1 分" in result["status"]
+    assert f"低于正常下限 {checkin.MIN_EXPECTED_POINTS}" in result["status"]
+
+
+def test_a_degraded_checkin_turns_the_run_red(monkeypatch, _stub_api, caplog):
+    """需求: 降级必须让 Actions 变红, 并说清这是「被降级」而不是 Cookie 过期。
+
+    两件事都要守住: 退出码非 0 (否则没人知道), 且提示要点名降级与 proof 环节
+    (否则照着「检查 Cookie」去查, 永远查不到问题)。
+    """
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
+    _stub_api["checkin_code"] = checkin.CheckinStatus.DEGRADED
+    _stub_api["checkin_points"] = "1"
+    _stub_api["reason"] = "degraded"
+
+    with caplog.at_level("INFO"):
+        exit_code = checkin.main()
+
+    assert exit_code == checkin.EXIT_CHECKIN_FAILED
+    assert "⚠️" in caplog.text
+    assert "签到只拿到 1 分" in caplog.text
+    assert "降级" in caplog.text
+
+
+def test_degraded_result_line_does_not_repeat_the_point_count(monkeypatch, _stub_api, caplog):
+    """需求: 降级那一行读起来要像人话。
+
+    状态里已经写了「只拿到 1 分」, 再补一句「获得 1 积分」就成了
+    「签到只拿到 1 分, 获得 1 积分, 总 441 积分」—— 同一件事说两遍。
+    """
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
+    _stub_api["checkin_code"] = checkin.CheckinStatus.DEGRADED
+    _stub_api["checkin_points"] = "1"
+    _stub_api["points"] = 441
+
+    with caplog.at_level("INFO"):
+        checkin.main()
+
+    line = next(line for line in caplog.text.splitlines() if "签到只拿到" in line)
+    assert "获得" not in line, line
+    assert "总 441 积分" in line
+
+
+# --------------------------------------------------------------------------
+# 接口契约守卫: 站点改字段就停机, 并把原始响应留在日志里
+# --------------------------------------------------------------------------
+
+
+def test_contract_violations_accepts_the_shapes_the_site_actually_returned():
+    """需求: 契约不能把真实响应判成违约。
+
+    期望值全部来自 2026-11-07 的实测响应 (见各条注释), 不是照着实现反推的 ——
+    否则契约只会把实现写错的地方也一起确认下来。
+    """
+    # GET /api/user/checkin/challenge 200
+    assert checkin.contract_violations(
+        "checkin/challenge", 0, {"code": 0, "nonce": "0b1e882c10dbb1a95a62f203d0a2aca8", "ttl": 300000}
+    ) == []
+    # POST /api/user/checkin code 0 (2026-11-07 实跑: 获得 10 积分)
+    assert checkin.contract_violations("checkin", 0, {"code": 0, "points": 10}) == []
+    # GET /api/user/points 200
+    assert checkin.contract_violations(
+        "points", 0, {"code": 0, "points": "450.0000000000000000", "streak": 1}
+    ) == []
+
+
+def test_contract_violations_ignores_fields_it_does_not_read():
+    """需求: 服务端加字段不算违约 —— 那不影响签到。
+
+    每次发版都报一次警, 只会训练人忽略红色通知, 真正的变化反而被淹掉。
+    """
+    assert checkin.contract_violations(
+        "checkin", 0, {"code": 0, "points": 10, "streak": 2, "list": [], "brandNew": "x"}
+    ) == []
+
+
+def test_contract_violations_names_the_field_and_both_types():
+    """需求: 违约说明要能直接照着改。
+
+    只说「契约不符」还得自己去翻文档才知道要改哪里, 所以字段名与两侧类型都要有。
+    """
+    problems = checkin.contract_violations("points", 0, {"code": 0, "points": 450})
+
+    assert len(problems) == 1
+    assert "points" in problems[0]
+    assert "字符串" in problems[0]  # 期望
+    assert "整数" in problems[0]  # 实际
+
+    missing = checkin.contract_violations("checkin", 0, {"code": 0})
+    assert "points" in missing[0]
+    assert "缺少字段" in missing[0]
+
+
+def test_contract_violations_does_not_mistake_a_bool_for_a_number():
+    """失败模式: JSON 的 true 在 Python 里是 int 的实例, isinstance 会放它过去。"""
+    problems = checkin.contract_violations("checkin", 0, {"code": 0, "points": True})
+
+    assert problems, "布尔值不能当成整数通过契约"
+    assert "布尔值" in problems[0]
+
+
+def test_contract_violations_skips_undeclared_codes():
+    """需求: 没声明契约的 code 不校验 —— 各自的失败分支会解释它。"""
+    # 重复签到 (code 1) 的 points 恒为 0 且没人读, 给它加契约只是替站点加约束
+    assert checkin.contract_violations("checkin", 1, {"code": 1, "points": 0}) == []
+    assert checkin.contract_violations("points", -2, {"code": -2, "message": "没有权限"}) == []
+
+
+def test_api_get_points_stops_when_points_is_no_longer_a_decimal_string(monkeypatch, caplog):
+    """失败模式: 积分字段换了类型后 int(float(...)) 仍能算出一个数, 静默继续。
+
+    实测 points 是 "450.0000000000000000"; 变成整数 450 说明站点改了接口。
+    这时不能再往下走（更不能用猜出来的余额去决定要不要兑换 500 积分）。
+    """
+    api = checkin.API()
+    monkeypatch.setattr(
+        api, "_make_request",
+        lambda *a, **k: _FakeResponse({"code": 0, "points": 450, "streak": 1}),
+    )
+
+    with caplog.at_level("ERROR"):
+        points_str, points_num = api.get_points(GLADOS_COOKIE)
+
+    assert api.points_failure == "contract"
+    assert (points_str, points_num) == ("None 积分", 0)
+    assert "契约不符" in caplog.text
+    # 原始响应必须逐字留下, 否则「它改了什么」还得自己去复现
+    assert '{"code": 0, "points": 450, "streak": 1}' in caplog.text
+
+
+def test_api_checkin_stops_when_the_checkin_response_loses_points(monkeypatch, caplog):
+    """失败模式: 签到响应里没有 points 字段, 旧代码会 KeyError 或记 0 分继续。"""
+    api = checkin.API()
+    api._wait_out_challenge = lambda: None
+    monkeypatch.setattr(
+        checkin.API,
+        "_make_request",
+        _with_challenge(lambda self, url, method, data=None, cookies="": _FakeResponse(
+            {"code": 0, "message": "ok"}
+        )),
+    )
+
+    with caplog.at_level("ERROR"):
+        result = api.checkin(GLADOS_COOKIE)
+
+    assert result["code"] is checkin.CheckinStatus.FAILURE
+    assert result["reason"] == "contract"
+    assert "契约不符" in caplog.text
+    assert '{"code": 0, "message": "ok"}' in caplog.text
+
+
+def test_a_shape_change_in_the_points_endpoint_turns_the_run_red(monkeypatch, caplog):
+    """需求: 接口变了就停机报错, 给出「先看原始响应再决定要不要适配」的下一步。
+
+    签到那一步即使看着成功也不算通过 —— 用户要的是「有变化就暂停」, 而不是带着
+    一个自己都没法确认的余额一路跑到兑换。
+    """
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
+    seen_urls = []
+
+    def handler(self, url, method, data=None, cookies=""):
+        seen_urls.append((method, url))
+        if url.endswith(checkin.API.POINTS_URL):
+            return _FakeResponse({"code": 0, "balance": "450.0000000000000000"})
+        return _FakeResponse({"code": 0, "points": 13})
+
+    monkeypatch.setattr(checkin.API, "_wait_out_challenge", lambda self: None)
+    monkeypatch.setattr(checkin.API, "_make_request", _with_challenge(handler))
+
+    with caplog.at_level("ERROR"):
+        exit_code = checkin.main()
+
+    assert exit_code == checkin.EXIT_CHECKIN_FAILED
+    assert "契约不符" in caplog.text
+    # 原始响应逐字在日志里 —— 这就是「它改了什么」的证据
+    assert '{"code": 0, "balance": "450.0000000000000000"}' in caplog.text
+    assert "站点接口的响应形状变了" in caplog.text
+    # 形状已经不可信, 就别再拿它去决定要不要兑换 500 积分
+    assert not any(checkin.API.EXCHANGE_URL in url for _, url in seen_urls), seen_urls
+
+
+def test_a_failed_points_request_alone_does_not_turn_the_run_red(monkeypatch, _stub_api, caplog):
+    """边界: 查总积分的普通网络失败不该让签到运行变红。
+
+    契约变更要停机 (那是「站点变了」), 但一次请求失败是「这次没查成」, 明天自然会
+    再查 —— 把它算失败等于把偶发网络抖动变成一封假的失败邮件。
+    """
+    monkeypatch.setenv(checkin.Config.ENV_COOKIES, GLADOS_COOKIE)
+
+    def flaky(self, cookies):
+        self._points_failure = "request"
+        return "None 积分", 0
+
+    monkeypatch.setattr(checkin.API, "get_points", flaky)
+
+    with caplog.at_level("INFO"):
+        exit_code = checkin.main()
+
+    assert exit_code == checkin.EXIT_OK
+    assert "总 None 积分" in caplog.text
+
+
 
 # --------------------------------------------------------------------------
 # 配置期 Cookie 校验 (只警告, 不泄露凭据)
@@ -501,10 +724,11 @@ def _stub_api(monkeypatch):
     """
     state = {
         "checkin_code": checkin.CheckinStatus.SUCCESS,
-        "checkin_points": "0",
+        "checkin_points": "13",
         "points": 500,
         "exchange_result": "兑换成功: plan500",
         "exchange_calls": [],
+        "reason": "",
     }
 
     monkeypatch.setattr(
@@ -517,16 +741,21 @@ def _stub_api(monkeypatch):
 
     def fake_checkin(self, cookies):
         code = state["checkin_code"]
-        # 与真 API.checkin 保持一致: status 是 code 的函数, 三个 code 各不相同。
+        # 与真 API.checkin 保持一致: status 是 code 的函数, 四个 code 各不相同。
         # (曾经这里把 REPEAT 也写成"签到失败", 结果行会打出"🔄 签到失败"这种矛盾文本。)
         return {
             "status": {
                 checkin.CheckinStatus.SUCCESS: "签到成功",
                 checkin.CheckinStatus.REPEAT: "重复签到",
+                checkin.CheckinStatus.DEGRADED: (
+                    f"签到只拿到 {state['checkin_points']} 分 "
+                    f"(低于正常下限 {checkin.MIN_EXPECTED_POINTS})"
+                ),
                 checkin.CheckinStatus.FAILURE: "签到失败",
             }[code],
             "points": state["checkin_points"],
             "code": code,
+            "reason": state["reason"],
         }
 
     monkeypatch.setattr(checkin.API, "exchange", fake_exchange)
@@ -672,7 +901,9 @@ def test_a_successful_exchange_is_visible_in_the_log(monkeypatch, caplog):
 
     def handler(self, url, method, data=None, cookies=""):
         if url.endswith(checkin.API.POINTS_URL):
-            return _FakeResponse({"code": 0, "points": checkin.Config.EXCHANGE_PLAN_POINTS})
+            # points 用真实响应里的形状 (字符串, 见 CONTRACTS): 这个 stub 冒充的是网络层,
+            # 形状对不上就会被契约守卫拦下, 那测到的就不是兑换留痕了。
+            return _FakeResponse({"code": 0, "points": "500.0000000000000000"})
         if url.endswith(checkin.API.EXCHANGE_URL):
             return _FakeResponse({"code": 0, "message": "ok"})
         return _FakeResponse({"code": 0, "points": 13, "message": "checkin ok"})
