@@ -182,13 +182,14 @@ GLADOS_USER_AGENT='粘贴你浏览器的 navigator.userAgent' \
 
 被判定为自动签到（`code 4`）的根因是「请求不像本人浏览器点的」。这里不是猜的，是拿真机
 抓包逐项对齐的 —— 期望值存在 [`tests/fixtures/browser_checkin_request.json`](tests/fixtures/browser_checkin_request.json)：
-2026-11-06 用 CDP 记录本机 Chrome 156（macOS）在 `https://glados.cloud/console/checkin`
-点「签到」时发出的那两次请求。
+2026-11-06 用 CDP 记录本机 Chrome 156(macOS)在 `https://glados.cloud/console/checkin`
+点「签到」时发出的那两次请求,2026-11-12 又用 Chrome 157 复核并更新了一次 —— 那次站点
+在请求体里加了 `tsState`(详见下文「签到前的观察挑战」)。
 
 | 项目 | 浏览器 | 脚本 |
 |---|---|---|
 | 方法 / 路径 | `GET /api/user/checkin/challenge` → `POST /api/user/checkin` | 一致 |
-| 请求体 | `{"token":"glados.cloud","nonce":…,"proof":…}`（142 字节，无空格） | 一致 |
+| 请求体 | `{"token":"glados.cloud","nonce":...,"proof":...,"tsState":"error"}`(160 字节,无空格) | 一致 |
 | `content-type` | `application/json;charset=UTF-8` | 一致 |
 | `accept` | `application/json, text/plain, */*` | 一致 |
 | `origin` | `https://glados.cloud` | 一致 |
@@ -207,7 +208,7 @@ GLADOS_USER_AGENT='粘贴你浏览器的 navigator.userAgent' \
 ## 签到前的「观察挑战」
 
 2026-11-05 起签到收益从 12~17 掉到 1 分，原因是站点加了一道 attestation。前端代码里叫
-`checkinProof`，位置在 console 包的 `main~20e9f87d` 模块 613：
+`checkinProof`,位置在 console 包的 `main~20e9f87d` 模块里(webpack 会重排编号,不写死):
 
 ```js
 salt = [103,108,97,100,111,115,45,111,98,115,101,114,118,101,45,118,49]  // "glados-observe-v1"
@@ -216,9 +217,18 @@ proof = hex(SHA-256(nonce + "." + salt))
 
 流程（与 `main~189dec1b` 的 `loadChallenge` / `solveChallenge` 逐行对齐）：
 
-1. `GET /api/user/checkin/challenge` 拿 `{nonce, ttl}`（`ttl` 实测 300000ms）；
+1. `GET /api/user/checkin/challenge` 拿 `{nonce, ttl}`(`ttl` 实测 300000ms,`turnstile` 可选);
 2. **至少停 2.5 秒**才提交 —— 前端写死 `if (Date.now() - at < 2500) await sleep(2500 - …)`；
-3. `POST /api/user/checkin`，体是 `{token, nonce, proof}`。
+3. `POST /api/user/checkin`,体是 `{token, nonce, proof, tsState}`。
+
+`tsState` 是 2026-11-12 才进请求体的第四个字段,取值来自等 Cloudflare Turnstile 的结果:
+挑战没下发验证码密钥时是 `off`,拿到 token 是 `ok`,等超时是 `timeout`,组件报错是 `error`。
+脚本不解验证码,只按 challenge 有没有下发 `turnstile` 分别报 `off` / `error`。
+
+目前它**不是**评分门槛:2026-11-12 02:20 那次真机点击时 Turnstile 组件加载失败
+(`challenges.cloudflare.com` 回 400 → failure_retry),浏览器带着 `tsState:"error"` 提交,
+照样拿到 11 分 —— 抓包就存在 `browser_checkin_request.json` 里。真到「不带验证码就降分」
+那天,它会先表现为分数掉到 1,由分数那条线报红。
 
 不带 proof 的 POST 一样返回 `code 0`，但服务端当成「未验证」只给 1 分，Cable / Streak
 都不发。所以脚本现在是 **challenge 拿不到就判签到失败**（fail-closed），让当天下一个 cron
@@ -241,7 +251,7 @@ proof = hex(SHA-256(nonce + "." + salt))
 | `endpoints` | 签到流程调用的接口 | `/user/checkin`、`/user/checkin/challenge` |
 | `salt` | `proof` 的盐值 | `glados-observe-v1` |
 | `digest` | `proof` 的摘要算法 | `SHA-256` |
-| `post_fields` | 签到请求体里的字段 | `nonce`、`proof`、`token` |
+| `post_fields` | 签到请求体里的字段 | `nonce`、`proof`、`token`、`tsState` |
 | `min_delay_ms` | 拿到 nonce 后最少等多久才提交 | `2500` |
 | `challenge_ttl_ms` | 挑战有效期 | `300000` |
 
@@ -256,10 +266,14 @@ proof = hex(SHA-256(nonce + "." + salt))
 看清改了什么、决定要不要适配，再改 `site_protocol.EXPECTED` 与对应实现，然后重新打开
 工作流。**这天不签到，只是丢掉一次机会；猜着签，丢的是分。**
 
-为什么不会因为发版误报：2026-11-06 与 11-07 两份真实构建，32 个 chunk 的文件名
-全不同（`main~189dec1b.806cceb9.chunk.js` → `main~21b3c6c3.91594a3a.chunk.js`）、
-webpack 模块编号也从 613 变成 614，但上面六个字段抽出来**逐字相同**。两份构建的源码
-片段就存在 `tests/fixtures/` 里，测试直接拿它们当期望值。
+为什么不会因为发版误报:2026-11-06 与 11-07 两份真实构建,32 个 chunk 的文件名
+全不同(`main~189dec1b.806cceb9.chunk.js` → `main~21b3c6c3.91594a3a.chunk.js`)、
+webpack 模块编号也从 613 变成 614,但上面六个字段抽出来**逐字相同**。三份构建的源码
+片段都存在 `tests/fixtures/` 里,测试直接拿它们当期望值。
+
+2026-11-12 那份是反例:协议**真的**变了(请求体多一个 `tsState`,`solveChallenge` 改成
+先拼到变量再 `abrupt("return", r)`),门禁当场报红并停在提交之前 —— 线上 11-11 那次签到
+的失败就是它,分一分没丢。
 
 四个刻意的取舍：
 

@@ -216,7 +216,7 @@ def test_checkin_wire_request_matches_the_captured_browser_request(_no_protocol_
     """失败模式: 请求体 / content-type / accept / origin / UA 与网页点签到时不一致。
 
     期望值逐项来自浏览器抓包 (tests/fixtures/browser_checkin_request.json):
-    请求体是紧凑 JSON ``{"token","nonce","proof"}`` 共 142 字节, content-type 带
+    请求体是紧凑 JSON ``{"token","nonce","proof","tsState"}`` 共 160 字节, content-type 带
     ``charset=UTF-8``, GET 与 POST 都不带 Referer。
     """
     capture = _browser_capture()
@@ -238,6 +238,27 @@ def test_checkin_wire_request_matches_the_captured_browser_request(_no_protocol_
     for name in ("accept", "content-type", "origin", "user-agent", "content-length"):
         assert checkin_request["headers"][name] == browser["headers"][name], name
     assert checkin_request["headers"]["cookie"] == GLADOS_COOKIE
+
+
+def test_checkin_reports_the_off_turnstile_state_when_no_captcha_was_asked_for(
+    _no_protocol_drift, monkeypatch
+):
+    """失败模式: 挑战没下发验证码密钥, 脚本却照旧报 "error"。
+
+    前端的 waitTurnstile 第一行就是「服务端没要求验证码 → {token:"", state:"off"}」,
+    tsState 因此是 "off"。报 "error" 等于告诉服务端「我试着解验证码但失败了」, 而
+    这次根本没要求, 平台指纹上就是一句假话。
+    """
+    api = checkin.API(user_agent=_browser_capture()["browser"]["user_agent"])
+
+    recorded = _capture_request(
+        monkeypatch,
+        {"code": 0, "points": 13},
+        lambda: api.checkin(GLADOS_COOKIE),
+        challenge_payload={"code": 0, "nonce": "n0nce", "ttl": 300000},
+    )
+
+    assert json.loads(recorded[-1]["body"])["tsState"] == "off"
 
 
 def test_checkin_sends_no_header_the_browser_never_sends(monkeypatch):
@@ -1064,6 +1085,7 @@ def test_api_checkin_automation_hint_still_works_without_device_fields(_no_proto
 
 PROTOCOL_1106 = os.path.join(REPO_ROOT, "tests", "fixtures", "site_protocol_2026-11-06.js")
 PROTOCOL_1107 = os.path.join(REPO_ROOT, "tests", "fixtures", "site_protocol_2026-11-07.js")
+PROTOCOL_1112 = os.path.join(REPO_ROOT, "tests", "fixtures", "site_protocol_2026-11-12.js")
 PAGE_FIXTURE = os.path.join(REPO_ROOT, "tests", "fixtures", "site_checkin_page.html")
 
 
@@ -1100,15 +1122,31 @@ class _FakeText:
         self.text = text
 
 
-def test_both_real_builds_agree_with_the_declared_protocol():
-    """两份相隔一天的真实构建抽出的协议必须与 site_protocol.EXPECTED 一致。
+def test_the_current_build_matches_the_declared_protocol():
+    """2026-11-12 抓下来的真实 bundle 必须与 site_protocol.EXPECTED 逐字吻合。
 
-    这是「不会因为前端发版误报」的证据: 32 个 chunk 的构建 hash 全变、webpack 模块
-    编号从 613 变成 614, 但六个字段逐字相同。期望值来自这两份实测抓下来的源码。
+    这一份就是脚本此刻实现的那套协议: 请求体多一个 tsState, solveChallenge 也换成了
+    「先拼到变量再 abrupt("return", 变量)」的写法, 抽取规则要跟得上。
+    """
+    actual = site_protocol.fingerprint({os.path.basename(PROTOCOL_1112): _read(PROTOCOL_1112)})
+
+    assert site_protocol.drift(site_protocol.EXPECTED, actual) == []
+
+
+def test_the_pre_turnstile_builds_report_exactly_the_body_field_drift():
+    """11-07 之前的两份真实构建只该报「请求体字段变了」这一条。
+
+    双重证据: 32 个 chunk 的构建 hash 全不同、webpack 模块编号 613→614, 其余五个字段
+    逐字相同 (所以发版不会误报); 而真的少了 tsState 时门禁会亮, 线上 2026-11-11 那次
+    签到的红灯就是它。
     """
     for path in (PROTOCOL_1106, PROTOCOL_1107):
         actual = site_protocol.fingerprint({os.path.basename(path): _read(path)})
-        assert site_protocol.drift(site_protocol.EXPECTED, actual) == [], path
+        problems = site_protocol.drift(site_protocol.EXPECTED, actual)
+
+        assert len(problems) == 1, path
+        assert "签到请求体字段" in problems[0]
+        assert "tsState" in problems[0]
 
 
 def test_drift_names_the_field_and_both_values():
@@ -1116,7 +1154,7 @@ def test_drift_names_the_field_and_both_values():
 
     两边都要写出来: 原来是什么、现在是什么。一个字段名 + 一个旧值 + 一个新值。
     """
-    changed = _read(PROTOCOL_1107).replace(
+    changed = _read(PROTOCOL_1112).replace(
         "[103,108,97,100,111,115,45,111,98,115,101,114,118,101,45,118,49]",
         "[103,108,97,100,111,115,45,111,98,115,101,114,118,101,45,118,50]",
     )
@@ -1135,7 +1173,7 @@ def test_a_new_challenge_endpoint_counts_as_drift():
 
     接口清单是签到流程的骨架, 换了名字必须报出来 —— 这条正是 11-05 那次事故的形状。
     """
-    changed = _read(PROTOCOL_1107).replace(
+    changed = _read(PROTOCOL_1112).replace(
         '"/user/checkin/challenge"', '"/user/checkin/attestation"'
     )
     actual = site_protocol.fingerprint({"bundle.js": changed})
@@ -1151,7 +1189,7 @@ def test_extra_fields_the_script_never_reads_are_not_drift():
 
     每次都报红只会训练人忽略红灯, 真出事那天就没人看了。
     """
-    changed = _read(PROTOCOL_1107) + '\n;var x="/user/checkin/bonus";'
+    changed = _read(PROTOCOL_1112) + '\n;var x="/user/checkin/bonus";'
     actual = site_protocol.fingerprint({"bundle.js": changed})
 
     assert site_protocol.drift(site_protocol.EXPECTED, actual) == []
@@ -1164,7 +1202,7 @@ def test_checkin_submits_nothing_when_the_protocol_changed(monkeypatch, caplog):
     人看完再决定改不改脚本。
     """
     page = _read(PAGE_FIXTURE)
-    changed = _read(PROTOCOL_1107).replace(
+    changed = _read(PROTOCOL_1112).replace(
         '"/user/checkin/challenge"', '"/user/checkin/attestation"'
     )
     posted = []

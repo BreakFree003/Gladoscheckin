@@ -8,15 +8,24 @@ code 0，只是把分数降级成 1 分。脚本从响应里看不出「协议�
 为什么指纹稳定，不会因为发版就误报: 2026-11-06 与 11-07 两次构建（32 个 chunk
 全量，所有构建 hash 都不同，模块编号还从 613 变成了 614）抽出的六个字段逐字相同。
 webpack 只改文件名与模块号，不改逻辑与字面量。所以这套指纹只在协议真的变时变。
+2026-11-12 的反例也印证了这一点: 协议真的变了(请求体多了 tsState), 指纹当场报了出
+来, 没有等到分数掉下来才发现。
 
 抽取规则都锚定在语义上，不依赖压缩后的变量名:
 - 接口清单: 直接匹配 "/user/checkin" 与 "/user/checkin/xxx" 这样的路径字面量；
 - 盐值: 17 字节的 char code 数组（前端用它绕开明文常量）；
 - 摘要算法: crypto.subtle.digest 的第一个参数；
 - 请求体字段: `.post("/user/checkin", …)` 的实参里的字面量 key，加上
-  solveChallenge 里 `abrupt("return", {…})` 返回对象的 key；
+  solveChallenge 通过 `abrupt("return", X)` 交出去的那个对象里的 key;
 - 最短停顿: `Date.now() - x.at) < N` 里的 N（`.at` 是对象属性名，不会被混淆）；
 - 挑战有效期: `.ttl || N` 里的 N。
+
+请求体字段这一项最容易随前端重构换写法, 所以两条路都认: 2026-11-07 之前 solveChallenge
+直接交出对象字面量, 2026-11-12 起改成先拼到变量再交
+(`r={nonce:e.t0,proof:e.t1,tsState:e.t2}; ... abrupt("return",r)`)。变量名会被压缩改掉,
+不能写死成 `r`, 只能顺着 return 的那个标识符回找它最近一次的 `X={...}` 赋值。同一版里还有
+`a.token&&(r.turnstile=a.token)` 这种按条件补字段的写法: turnstile 是可选的, 服务端没
+下发验证码密钥时整个字段都不出现, 脚本也不发它, 所以不写进基线。
 """
 
 import re
@@ -27,7 +36,7 @@ EXPECTED: Dict[str, List] = {
     "endpoints": ["/user/checkin", "/user/checkin/challenge"],
     "salt": ["glados-observe-v1"],
     "digest": ["SHA-256"],
-    "post_fields": ["nonce", "proof", "token"],
+    "post_fields": ["nonce", "proof", "token", "tsState"],
     "min_delay_ms": [2500],
     "challenge_ttl_ms": [300000],
 }
@@ -50,7 +59,8 @@ _DIGEST = re.compile(r'subtle\.digest\("([A-Za-z0-9-]+)"')
 _MIN_DELAY = re.compile(r"Date\.now\(\)-[A-Za-z_$][\w$]*\.at\)<(\d+)\)")
 _TTL = re.compile(r"\.ttl\|\|(\d+(?:e\d+)?)\)")
 _POST_CALL = re.compile(r'\.post\("/user/checkin"')
-_RETURN_OBJECT = re.compile(r'abrupt\("return",\s*\{')
+_IDENT = re.compile(r"[A-Za-z_$][\w$]*")
+_RETURN_CALL = re.compile(r'abrupt\("return"\s*,\s*')
 _OBJECT_KEY = re.compile(r"(?:^|[{,])\s*([A-Za-z_$][\w$]*)\s*:")
 
 
@@ -118,21 +128,49 @@ def _salts(blob: str) -> List[str]:
     return sorted(found)
 
 
+def _returned_keys(body: str) -> set:
+    """solveChallenge 通过 `abrupt("return", X)` 交出去的对象里的 key。
+
+    两种写法都要认, 站点在 2026-11-12 从第一种换成了第二种:
+    - 直接给字面量: `abrupt("return", {nonce: ..., proof: ...})`
+    - 先拼到变量再交: `r={nonce: ..., proof: ..., tsState: ...}` 然后
+      `abrupt("return", r)`
+
+    第二种的变量名会被压缩改掉, 所以不能写死成 `r`: 顺着 return 的那个标识符,
+    回找它最近一次的 `X={...}` 赋值。找到的是「交出去的那一份」, 而不是包里任意
+    一个同名变量。
+    """
+    keys: set = set()
+    for call in _RETURN_CALL.finditer(body):
+        cursor = call.end()
+        while cursor < len(body) and body[cursor].isspace():
+            cursor += 1
+        if cursor < len(body) and body[cursor] == "{":
+            keys |= _object_keys(_balanced(body, cursor))
+            continue
+        identifier = _IDENT.match(body, cursor)
+        if not identifier:
+            continue
+        assignment = None
+        pattern = re.compile(r"\b" + re.escape(identifier.group()) + r"\s*=\s*\{")
+        for found in pattern.finditer(body, 0, cursor):
+            assignment = found
+        if assignment:
+            keys |= _object_keys(_balanced(body, assignment.end() - 1))
+    return keys
+
+
 def _post_fields(blob: str) -> List[str]:
-    """签到请求体的字段名: POST 实参里的字面量 key + solveChallenge 返回对象的 key。"""
+    """签到请求体的字段名: POST 实参里的字面量 key + solveChallenge 交出去的对象的 key。"""
     fields = set()
     for match in _POST_CALL.finditer(blob):
         opener = _first_opener(blob, match.end())
         if opener > 0:
             fields |= _object_keys(_balanced(blob, opener))
 
-    # 只在这一个方法体里找返回对象: 整个包里 abrupt("return", {…}) 有八处，
-    # 全抓会把别的接口的字段混进来。
-    body = _method_body(blob, "solveChallenge")
-    for match in _RETURN_OBJECT.finditer(body):
-        opener = _first_opener(body, match.end() - 1)
-        if opener > 0:
-            fields |= _object_keys(_balanced(body, opener))
+    # 只在这一个方法体里找: 整个包里 abrupt("return", ...) 有八处, 全抓会把别的
+    # 接口的字段混进来。
+    fields |= _returned_keys(_method_body(blob, "solveChallenge"))
     return sorted(fields)
 
 

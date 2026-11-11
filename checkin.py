@@ -80,6 +80,19 @@ CHALLENGE_SALT = "glados-observe-v1"
 浪费一次 nonce, 所以这里跟着前端一起停。"""
 CHALLENGE_MIN_DELAY_SECONDS = 2.5
 
+"""签到请求体里的第三个信号: tsState。
+
+2026-11-12 起前端在 POST 体里多带一个 tsState, 值取自等 Cloudflare Turnstile 的结果:
+挑战没下发验证码密钥时是 "off", 拿到 token 是 "ok", 等超时是 "timeout", 组件报错是
+"error"。脚本不执行 Turnstile, 所以只能照实说「没拿到 token」: 服务端没要验证码就报
+"off", 要了而脚本拿不到就报 "error"。
+
+它不是评分门槛, 2026-11-12 的真机抓包已经给出答案: 浏览器那次 Turnstile 加载失败,
+带着 tsState "error" 提交, 照样拿到 11 分。所以照抄前端的行为就够了, 不需要真去解
+验证码。一旦哪天不带验证码会被降分, 分数那条线会先红。"""
+CHALLENGE_TS_STATE_OFF = "off"
+CHALLENGE_TS_STATE_NO_TOKEN = "error"
+
 """一次正常签到至少该拿到多少分。低于它, 这次签到算失败。
 
 为什么要这个数: 站点把「没做挑战的签到」降级成 1 分时, 响应仍然是 code 0 —— 光看
@@ -97,7 +110,9 @@ MIN_EXPECTED_POINTS = 2
 于是「签到成功 0 分」照样退出 0。这类静默失败比报错难查得多, 所以宁可停机。
 
 只声明脚本真正读取的字段, 并且类型都取自实测响应:
-- challenge 成功: {"code":0,"nonce":"…","ttl":300000} → nonce 是字符串
+- challenge 成功: {"code":0,"nonce":"...","ttl":300000,"turnstile":"0x4AAA..."}
+  → nonce 是字符串。turnstile 是可选的, 只有服务端要验证码时才下发, 脚本只拿它判断
+  tsState 报什么, 不往请求里塞, 所以不进契约。
 - checkin code 0: 本次获得的分数是**整数** (2026-11-07 实跑 log 打出「获得 10 积分」,
   旧代码是 str(data["points"]) 直出, 所以服务端给的就是 10 而不是 "10.000…")
 - points 成功: points 是 "450.0000000000000000" 这样的**字符串**
@@ -551,11 +566,20 @@ class API:
     def _get_checkin_data(self, challenge: Dict) -> Dict[str, str]:
         """拼签到请求体。
 
-        2026-11-06 抓包得到的字段顺序是 token → nonce → proof; 前端用
-        `Object.assign({token: hostname}, {nonce, proof})`, 所以 token 在最前。
+        字段顺序照抄 2026-11-12 的浏览器抓包: token → nonce → proof → tsState。前端是
+        `Object.assign({token: hostname}, solveChallenge 的返回值)`, 所以 token 在最前。
         顺序不影响服务端, 但字节对齐才能让抓包对照有意义。"""
         nonce = challenge["nonce"]
-        return {"token": DOMAIN, "nonce": nonce, "proof": self._compute_proof(nonce)}
+        return {
+            "token": DOMAIN,
+            "nonce": nonce,
+            "proof": self._compute_proof(nonce),
+            "tsState": (
+                CHALLENGE_TS_STATE_NO_TOKEN if challenge.get("turnstile")
+                else CHALLENGE_TS_STATE_OFF
+            ),
+        }
+
 
     @log_method
     def checkin(self, cookies: str) -> Dict[str, Union[str, CheckinStatus]]:

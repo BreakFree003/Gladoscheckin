@@ -1,17 +1,18 @@
 {
   "_comment": [
-    "真机抓包: 2026-11-06 本机 Chrome 156 (macOS) 在 https://glados.cloud/console/checkin 点击「签到」按钮时, 浏览器实际发出的两次请求。",
-    "抓取方式: CDP (127.0.0.1:9222) 打开 Network 域, 监听 Network.requestWillBeSent 与 Network.getResponseBody。",
-    "站点自 2026-11 起在签到前加了一道「观察挑战」: 先 GET 拿 nonce, 停顿至少 2.5 秒, 再把 {token, nonce, proof} POST 上去。",
+    "真机抓包: 2026-11-12 02:20 (UTC 2026-11-11T18:20) 本机 Chrome 157 (macOS) 在 https://glados.cloud/console/checkin 点击「签到」按钮时, 浏览器实际发出的两次请求。",
+    "抓取方式: Chrome DevTools MCP 打开 Network 面板, 读 Network.getRequestPostData 与响应体。",
+    "站点自 2026-11 起在签到前加了一道「观察挑战」: 先 GET 拿 nonce, 停顿至少 2.5 秒, 再把 {token, nonce, proof, tsState} POST 上去。",
     "proof = hex(SHA-256(nonce + '.' + 'glados-observe-v1')); 盐值来自前端常量里的 char code 数组。",
-    "cookie 值已脱敏, 只留字段名; 原始值为 354 字节, 含 __stripe_mid / eu_cookie / koa:sess / koa:sess.sig / gld:sess / gld:sess.sig。",
+    "2026-11-12 这版多两样东西: challenge 响应下发 turnstile 站点密钥, POST 体多一个 tsState。那次 Turnstile 组件加载失败 (challenges.cloudflare.com 回 400 → failure_retry), 浏览器带 tsState 'error' 提交, 照样拿到 11 分 —— 这是「验证码不是评分门槛」的直接证据。",
+    "cookie 值已脱敏, 只留字段名; 真实值含 gld:accts / gld:accts.sig / gld:sess / gld:sess.sig。",
     "注意: 页面 /console 带 <meta name=\"referrer\" content=\"no-referrer\">, 因此这两次请求都没有任何 Referer 头。"
   ],
-  "captured_at": "2026-11-06T09:51:13Z",
-  "capture_method": "chrome-devtools-protocol",
+  "captured_at": "2026-11-11T18:20:24Z",
+  "capture_method": "chrome-devtools-mcp",
   "browser": {
-    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
-    "navigator_languages": ["zh-CN"],
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
+    "navigator_languages": ["zh-CN", "zh", "en"],
     "page": "https://glados.cloud/console/checkin",
     "meta_referrer": "no-referrer"
   },
@@ -21,44 +22,45 @@
     "status": 200,
     "response": {
       "code": 0,
-      "nonce": "c14fffc6202e7a520188c6b4fcea6511",
-      "ttl": 300000
+      "nonce": "de37ab39cb25ed76a54d2ff007db8d6d",
+      "ttl": 300000,
+      "turnstile": "0x4AAAAAAFF5pkT0bg7fX7nw"
     }
   },
   "request": {
     "method": "POST",
     "url": "https://glados.cloud/api/user/checkin",
     "protocol": "h2",
-    "postData": "{\"token\":\"glados.cloud\",\"nonce\":\"c14fffc6202e7a520188c6b4fcea6511\",\"proof\":\"276d50b210594ccd43a8c57f9e87e3d668757a32fe1397333ad1bc2562f2e9d1\"}",
-    "contentLength": 142,
+    "postData": "{\"token\":\"glados.cloud\",\"nonce\":\"de37ab39cb25ed76a54d2ff007db8d6d\",\"proof\":\"d0e3c5b6fe6c477891ab897441dd6045967e2d46d976237fa2e61e998a8baa69\",\"tsState\":\"error\"}",
+    "contentLength": 160,
     "headers": {
       "accept": "application/json, text/plain, */*",
       "accept-encoding": "gzip, deflate, br, zstd",
-      "accept-language": "zh-CN,zh;q=0.9",
-      "content-length": "142",
+      "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "content-length": "160",
       "content-type": "application/json;charset=UTF-8",
-      "cookie": "<redacted; fields: __stripe_mid, eu_cookie, koa:sess, koa:sess.sig, gld:sess, gld:sess.sig>",
+      "cookie": "<redacted; fields: gld:accts, gld:accts.sig, gld:sess, gld:sess.sig>",
       "dnt": "1",
       "origin": "https://glados.cloud",
       "priority": "u=1, i",
-      "sec-ch-ua": "\"Not:A-Brand\";v=\"8\", \"Chromium\";v=\"156\", \"Google Chrome\";v=\"156\"",
+      "sec-ch-ua": "\"Not-A.Brand\";v=\"99\", \"Google Chrome\";v=\"157\", \"Chromium\";v=\"157\"",
       "sec-ch-ua-mobile": "?0",
       "sec-ch-ua-platform": "\"macOS\"",
       "sec-fetch-dest": "empty",
       "sec-fetch-mode": "cors",
       "sec-fetch-site": "same-origin",
       "sec-gpc": "1",
-      "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+      "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
     }
   },
   "response": {
     "status": 200,
     "body": {
-      "code": 1,
-      "points": 0,
-      "repeated": true,
-      "message": "Today's observation logged. Return tomorrow for more points.",
-      "streak": 0
+      "code": 0,
+      "points": 11,
+      "repeated": false,
+      "message": "Checkin! Got 11 Points",
+      "streak": 6
     }
   },
   "script_control": {
@@ -67,12 +69,12 @@
       "accept": "application/json, text/plain, */*",
       "content-type": "application/json;charset=UTF-8",
       "origin": "https://glados.cloud",
-      "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+      "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
     },
     "must_be_absent": ["referer", "authorization"]
   },
   "browser_only_headers": {
-    "_comment": "由浏览器进程生成、脚本刻意不伪造的头。它们缺失时服务端仍然受理 (2026-09-26 与 2026-11-06 两次实测), 见 tests 与 README。",
+    "_comment": "由浏览器进程生成、脚本刻意不伪造的头。它们缺失时服务端仍然受理 (2026-09-26 与 2026-11-12 两次实测), 见 tests 与 README。",
     "headers": [
       "accept-encoding",
       "accept-language",
@@ -88,8 +90,13 @@
     ]
   },
   "known_proofs": {
-    "_comment": "两次独立真机抓包得到的 nonce → proof 对, 用于把算法钉在外部证据上, 而不是从实现反推。",
+    "_comment": "三次独立真机抓包得到的 nonce → proof 对, 用于把算法钉在外部证据上, 而不是从实现反推。",
     "pairs": [
+      {
+        "captured_at": "2026-11-12T02:20:24+08:00",
+        "nonce": "de37ab39cb25ed76a54d2ff007db8d6d",
+        "proof": "d0e3c5b6fe6c477891ab897441dd6045967e2d46d976237fa2e61e998a8baa69"
+      },
       {
         "captured_at": "2026-11-06T09:51:13Z",
         "nonce": "c14fffc6202e7a520188c6b4fcea6511",
