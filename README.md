@@ -2,18 +2,61 @@
 
 > 优惠码 **`PORTALGUN`**，购买套餐可享 **20% OFF**（八折）
 
-个人自用：用 GitHub Actions 每天定时跑一次 `checkin.py`，给 GLaDOS（`glados.cloud`）
-签到。**签到失败时让作业变红，靠 GitHub 的失败邮件收到通知。**
+个人自用：给 GLaDOS（`glados.cloud`）每天签到一次。原来跑在 GitHub Actions 上，
+签到失败让作业变红、靠 GitHub 的失败邮件收到通知。
+
+> **2026-11-14 起工作流已停用。** 站点把 Cloudflare Turnstile 从「只记录」改成了
+> 「硬校验」：签到请求必须带一个 token，而 GitHub Actions 里没有浏览器，拿不到 token，
+> 每天必然回 `code 5`。原因、证据和「为什么这条路没有可行解」见下文
+> 「为什么停用 GitHub Actions」。
+> 在那之前想拿积分，只能去 https://glados.cloud/console/checkin 手动点一次。
 
 | 文件 | 作用 |
 |---|---|
 | `checkin.py` | 签到脚本（唯一入口） |
 | `logging_config.py` | 日志配置 |
-| `.github/workflows/gladosCheck.yml` | 定时任务 |
+| `.github/workflows/gladosCheck.yml` | 定时任务（已停用，见下） |
 | `tests/test_checkin.py` | 签到脚本的测试 |
 | `tests/test_workflow_gate.py` | workflow 里「今天是否已签到」那一步的测试 |
 
+## 为什么停用 GitHub Actions（2026-11-14）
+
+2026-11-14 凌晨两次定时运行都失败了（run `43475250560`、`43514700769`），服务端返回：
+
+```
+{"code":5,"reason":"turnstile","retryable":true,"points":0,"breakdown":null,
+ "message":"Cloudflare verification failed. Nothing was recorded — please retry.","list":[]}
+```
+
+原因是站点把 Cloudflare Turnstile 从「记录一下」改成了「必须通过」：签到 POST 现在要带
+一个 turnstile token，服务端拿这次挑战的 nonce 去 Cloudflare 验。同一个请求体，去掉
+token 就是 `code 5`，带上就是 `code 0`。
+
+判断依据（2026-11-14 实测）：
+
+- 本机住宅 IP、同一份 Cookie、同样的字段重放：`tsState` 填 `off` 回 code 5，填 `ok`
+  也回 code 5 —— 跟 Cookie、UA、出口 IP、`tsState` 都无关，缺的就是 token。
+- 同一个 Chrome 里点一次签到就过了：请求体 1030 字节，`tsState` 为 `ok`，多出一个
+  `turnstile` 字段，服务端回 `code 0`（+9 分）。失败的请求只有 162 字节，没有这个字段。
+- 11-12 之前不校验：那天真机带着 `tsState:"error"` 提交照样拿到 11 分。所以这道门槛是
+  11-13 到 11-14 之间上线的。
+
+为什么脚本拿不到 token：它由 `challenges.cloudflare.com` 的 JS 在浏览器里签发，一次性、
+绑定当次 nonce、五分钟过期。纯 HTTP 请求算不出来，也没法预先算一个存着用。
+
+为什么「签到前的协议比对」没拦住：六个指纹字段一个都没变。Turnstile 本来就是前端里
+按需补上的可选字段，当初就没进基线 —— 而这次变的是服务端的校验策略，前端这段逻辑
+一直就在。这也是那套门禁的边界：它守的是前端的形状，不是服务端的策略。
+
+所以只要站点还要求 Turnstile token，GitHub Actions 就没有可行解：runner 上没有浏览器；
+装一个也只是把人机验证搬进一个更容易被判定为自动化的环境。
+
+工作流用 `gh workflow disable gladosCheck.yml` 停掉了。本机怎么做另行讨论；在那之前想拿分，
+去签到页手动点一次（少数情况下会弹「请验证您是真人」的复选框，点一下即可）。
+
 ## 它每天是怎么跑的
+
+> 这一节描述的是停用前的跑法，留作记录。
 
 **一天 4 个槽位，北京时间 00:07 / 06:23 / 12:41 / 18:13。**
 
@@ -156,6 +199,7 @@ GitHub 发失败邮件**。所以别关掉 Actions 的失败通知：
 | `⚠️ 签到只拿到 1 分 (低于正常下限 2)` | 服务端认了签到（`code 0`），但按「未验证」降级记分 | 先看是否仍能取到 challenge、proof 是否按 `SHA-256(nonce + '.' + 盐)` 算出；若站点又加了新环节，抓一次网页端签到请求对照上文「观察挑战」 |
 | `站点签到协议变了, 已暂停签到` | 签到页面/JS 里的协议与基线对不上，脚本没提交签到 | 看紧跟着的几行 ERROR，它逐条写了哪个字段从什么变成了什么；改 `site_protocol.EXPECTED` 与对应实现后重新打开工作流。详见上文「签到前的协议比对」 |
 | `接口 … 的响应形状变了 (契约不符)` | 站点改了字段名或类型，脚本已停机 | 那一行带着完整原始响应，照它改 `CONTRACTS` 与解析逻辑，再打开工作流 |
+| `签到失败: {"code":5,"reason":"turnstile",…}` | 站点要求 Cloudflare Turnstile token；纯脚本拿不到（runner 里没有浏览器） | 这就是 2026-11-14 停用工作流的原因，见上文；恢复只能靠真浏览器签到 |
 | 作业变红，末尾 `签到失败 (退出码 1)` | 这次签到没成功 | 紧跟着的那行会写下一步；再按上面依次检查 Cookie 和 `GLADOS_USER_AGENT` |
 
 日志时间戳是 **UTC**（runner 的时区），和 GitHub 日志每行自带的时间前缀一致。
@@ -177,6 +221,9 @@ GLADOS_USER_AGENT='粘贴你浏览器的 navigator.userAgent' \
 
 注意 `重复签到` 也是成功：站点回的是 `code 1`，表示今天这一次它已经记过了；
 退出码仍然是 `0`，不会把作业染红。
+
+注意上面那个跑法现在也会撞 `code 5`：本机纯 HTTP 脚本同样没有浏览器，
+拿不到 Turnstile token。本机要能签到，得让它跑在真浏览器里 —— 方案另议。
 
 ## 为什么请求要长得像浏览器
 
@@ -225,10 +272,13 @@ proof = hex(SHA-256(nonce + "." + salt))
 挑战没下发验证码密钥时是 `off`,拿到 token 是 `ok`,等超时是 `timeout`,组件报错是 `error`。
 脚本不解验证码,只按 challenge 有没有下发 `turnstile` 分别报 `off` / `error`。
 
-目前它**不是**评分门槛:2026-11-12 02:20 那次真机点击时 Turnstile 组件加载失败
+2026-11-12 时它还**不是**门槛:那天真机点击时 Turnstile 组件加载失败
 (`challenges.cloudflare.com` 回 400 → failure_retry),浏览器带着 `tsState:"error"` 提交,
-照样拿到 11 分 —— 抓包就存在 `browser_checkin_request.json` 里。真到「不带验证码就降分」
-那天,它会先表现为分数掉到 1,由分数那条线报红。
+照样拿到 11 分 —— 抓包就存在 `browser_checkin_request.json` 里。
+
+2026-11-13 起它变成了硬门槛,而且形式跟当时的预判不一样:站点不是把分数降成 1,而是直接
+回 `code 5`(见上文「为什么停用 GitHub Actions」);请求体里必须有 `turnstile` 字段,
+`tsState` 填什么已经不影响结果。
 
 不带 proof 的 POST 一样返回 `code 0`，但服务端当成「未验证」只给 1 分，Cable / Streak
 都不发。所以脚本现在是 **challenge 拿不到就判签到失败**（fail-closed），让当天下一个 cron

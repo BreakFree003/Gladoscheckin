@@ -1,3 +1,15 @@
+# 已停用（2026-11-14）。
+#
+# 站点把 Cloudflare Turnstile 从「只记录」改成了「硬校验」：签到 POST 必须带一个由浏览器
+# 现场签发的 token（一次性、绑 nonce、5 分钟过期）。runner 上没有浏览器，拿不到 token，
+# 每次都会回 {"code":5,"reason":"turnstile"}，一分也拿不到。
+#
+# 所以用 `gh workflow disable gladosCheck.yml` 停掉了这个工作流。原因、证据和为什么这条路
+# 没有可行解，见 README 的「为什么停用 GitHub Actions」。本机怎么做另行讨论；在那之前
+# 想拿积分就手动去 https://glados.cloud/console/checkin 点一次。
+#
+# 下面的配置保持原样，留作记录 —— 哪天站点取消这道门槛，重新 enable 就能用。
+
 name: auto check
 
 on:
